@@ -1,0 +1,54 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo lock file (uncomment if building a library)
+# Cargo.lock
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing and coverage
+*.profraw
+*.profdata
+coverage/
+tarpaulin-report.html
+
+# Documentation
+/doc/
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/
+
+# Backup files
+*.bak
+*.backup
+
+# OS specific
+Thumbs.db
+.Spotlight-V100
+.Trashes
+
+# Android Studio (if using for cross-platform dev)
+*.iml
+.gradle
+local.properties
+
+# Build outputs
+*.so
+*.dylib
+*.dll
+*.a
+
+# Debug builds
+debug/
