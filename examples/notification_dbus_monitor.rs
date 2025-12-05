@@ -28,7 +28,7 @@ use std::collections::{HashMap, VecDeque};
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use zbus::{message::Message, Connection};
 
@@ -406,10 +406,20 @@ impl GarminNotificationHandler {
     /// Clean up old notifications that were never retrieved by the watch
     /// This helps prevent notification count from growing too large
     pub async fn cleanup_old_notifications(&self) {
-        let mut last_cleanup = self.last_cleanup_time.lock().unwrap();
+        // Check if cleanup is needed and update timestamp
+        let should_cleanup = {
+            let mut last_cleanup = self.last_cleanup_time.lock().unwrap();
 
-        // Only cleanup every 2 minutes
-        if last_cleanup.elapsed() < std::time::Duration::from_secs(120) {
+            // Only cleanup every 2 minutes
+            if last_cleanup.elapsed() < std::time::Duration::from_secs(120) {
+                false
+            } else {
+                *last_cleanup = std::time::Instant::now();
+                true
+            }
+        }; // MutexGuard dropped here
+
+        if !should_cleanup {
             return;
         }
 
@@ -436,8 +446,8 @@ impl GarminNotificationHandler {
             );
 
             // Send remove commands to watch for each notification
-            for (id, notif_type) in notifications_to_remove {
-                if let Err(e) = self.remove_notification(id, notif_type) {
+            for (id, _notif_type) in notifications_to_remove {
+                if let Err(e) = self.remove_notification(id).await {
                     eprintln!("   ⚠️  Failed to remove notification {}: {}", id, e);
                 }
             }
@@ -463,28 +473,34 @@ impl GarminNotificationHandler {
                     .collect()
             };
 
-            for (id, notif_type) in all_notifications {
-                if let Err(e) = self.remove_notification(id, notif_type) {
+            for (id, _notif_type) in all_notifications {
+                if let Err(e) = self.remove_notification(id).await {
                     eprintln!("   ⚠️  Failed to remove notification {}: {}", id, e);
                 }
             }
 
             // Note: Counts are now calculated dynamically, no need to reset manually
         }
-
-        *last_cleanup = std::time::Instant::now();
     }
 
     /// Remove a notification from the watch
-    pub fn remove_notification(
+    pub async fn remove_notification(
         &self,
         notification_id: i32,
-        notification_type: NotificationType,
     ) -> garmin_v2_communicator::Result<()> {
         println!(
             "🗑️  Removing notification ID {} from watch",
             notification_id
         );
+
+        // Get notification type before removing
+        let notification_type = {
+            let stored = self.stored_notifications.lock().unwrap();
+            stored
+                .get(&notification_id)
+                .map(|spec| spec.notification_type)
+                .unwrap_or(NotificationType::Generic)
+        };
 
         // Remove from stored notifications
         {
@@ -503,7 +519,8 @@ impl GarminNotificationHandler {
 
         let gfdi_message = self.wrap_in_gfdi_envelope(5033, &remove_msg);
         self.communicator
-            .send_message("notification_remove", &gfdi_message)?;
+            .send_message("notification_remove", &gfdi_message)
+            .await?;
 
         Ok(())
     }
@@ -602,7 +619,7 @@ impl GarminNotificationHandler {
 
             // Only remove notifications that are both unretrieved AND old enough
             let total_unretrieved = unretrieved_ids.len();
-            for (id, notif_type) in &unretrieved_ids {
+            for (id, _notif_type) in &unretrieved_ids {
                 // Check age of this notification
                 let is_old = {
                     let stored = self.stored_notifications.lock().unwrap();
@@ -614,7 +631,7 @@ impl GarminNotificationHandler {
                 };
 
                 if is_old {
-                    if let Err(e) = self.remove_notification(*id, *notif_type) {
+                    if let Err(e) = self.remove_notification(*id).await {
                         eprintln!("   ⚠️  Failed to remove notification {}: {}", id, e);
                     } else {
                         removed_count += 1;
@@ -653,9 +670,10 @@ impl GarminNotificationHandler {
             match self
                 .communicator
                 .send_message("notification", &gfdi_message)
+                .await
             {
                 Ok(_) => {
-                    // TX watchdog removed - only monitoring RX traffic
+                    println!("   ✅ Notification sent successfully");
                 }
                 Err(e) => {
                     let err_msg = format!("{}", e);
@@ -697,9 +715,10 @@ impl GarminNotificationHandler {
         match self
             .communicator
             .send_message("notification", &gfdi_message)
+            .await
         {
             Ok(_) => {
-                // TX watchdog removed - only monitoring RX traffic
+                println!("   ✅ Notification sent successfully");
             }
             Err(e) => {
                 let err_msg = format!("{}", e);
@@ -783,7 +802,7 @@ impl GarminNotificationHandler {
     }
 
     /// Handle NotificationControl request from watch
-    pub fn on_notification_control(
+    pub async fn on_notification_control(
         &self,
         notification_id: i32,
         command: u8,
@@ -820,7 +839,8 @@ impl GarminNotificationHandler {
 
             let response = self.wrap_in_gfdi_envelope(0x1388, &response_payload);
             self.communicator
-                .send_message("notification_action_ack", &response)?;
+                .send_message("notification_action_ack", &response)
+                .await?;
 
             println!("   ✅ Legacy action ACK sent to watch");
             return Ok(());
@@ -869,6 +889,7 @@ impl GarminNotificationHandler {
                 if let Err(e) = self
                     .communicator
                     .send_message("notification_remove", &gfdi_message)
+                    .await
                 {
                     eprintln!("   ⚠️  Failed to send remove notification: {}", e);
                 }
@@ -892,7 +913,8 @@ impl GarminNotificationHandler {
 
             let response = self.wrap_in_gfdi_envelope(0x1388, &response_payload);
             self.communicator
-                .send_message("notification_action_ack", &response)?;
+                .send_message("notification_action_ack", &response)
+                .await?;
 
             println!("   ✅ Action ACK sent to watch");
             return Ok(());
@@ -1090,6 +1112,7 @@ impl GarminNotificationHandler {
                 match self
                     .communicator
                     .send_message("notification_data", &data_msg)
+                    .await
                 {
                     Ok(_) => {
                         // TX watchdog removed - only monitoring RX traffic
@@ -1123,7 +1146,7 @@ impl GarminNotificationHandler {
     }
 
     /// Delete a notification by ID and type
-    pub fn delete_notification(
+    pub async fn delete_notification(
         &self,
         id: i32,
         notification_type: NotificationType,
@@ -1154,6 +1177,7 @@ impl GarminNotificationHandler {
         match self
             .communicator
             .send_message("notification", &gfdi_message)
+            .await
         {
             Ok(_) => {
                 // TX watchdog removed - only monitoring RX traffic
@@ -1175,7 +1199,10 @@ impl GarminNotificationHandler {
         Ok(())
     }
 
-    pub fn on_set_call_state(&self, call_spec: CallSpec) -> garmin_v2_communicator::Result<()> {
+    pub async fn on_set_call_state(
+        &self,
+        call_spec: CallSpec,
+    ) -> garmin_v2_communicator::Result<()> {
         let id = call_spec.get_id();
 
         match call_spec.command {
@@ -1205,6 +1232,7 @@ impl GarminNotificationHandler {
                 match self
                     .communicator
                     .send_message("notification", &gfdi_message)
+                    .await
                 {
                     Ok(_) => {
                         // TX watchdog removed - only monitoring RX traffic
@@ -1243,7 +1271,8 @@ impl GarminNotificationHandler {
 
                 let gfdi_message = self.wrap_in_gfdi_envelope(5033, &remove_msg);
                 self.communicator
-                    .send_message("call_end_notification", &gfdi_message)?;
+                    .send_message("call_end_notification", &gfdi_message)
+                    .await?;
 
                 println!("✅ Call end notification sent (ID: {})", id);
             }
@@ -1301,17 +1330,9 @@ impl GarminNotificationHandler {
 // Real Bluetooth Implementation using BlueR
 // ============================================================================
 
-// Message type for the write queue
-struct WriteRequest {
-    characteristic: Characteristic,
-    data: Vec<u8>,
-    response_tx: tokio::sync::oneshot::Sender<std::result::Result<(), bluer::Error>>,
-}
-
 struct BlueRSupport {
     device: Arc<Device>,
     characteristics: Arc<Mutex<HashMap<String, Characteristic>>>,
-    write_tx: mpsc::UnboundedSender<WriteRequest>,
 }
 
 impl BlueRSupport {
@@ -1343,23 +1364,9 @@ impl BlueRSupport {
         // Wait a moment for connection to stabilize
         sleep(Duration::from_millis(500)).await;
 
-        // Create write queue channel
-        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<WriteRequest>();
-
-        // Spawn write worker thread
-        tokio::spawn(async move {
-            println!("📝 BLE Write worker thread started");
-            while let Some(req) = write_rx.recv().await {
-                let result = req.characteristic.write(&req.data).await;
-                let _ = req.response_tx.send(result);
-            }
-            panic!("📝 BLE Write worker thread stopped");
-        });
-
         Ok(Self {
             device: Arc::new(device),
             characteristics: Arc::new(Mutex::new(HashMap::new())),
-            write_tx,
         })
     }
 
@@ -1443,7 +1450,7 @@ impl BlueRSupport {
                         }
 
                         // Process received data through communicator
-                        if let Err(e) = communicator.on_characteristic_changed(&value) {
+                        if let Err(e) = communicator.on_characteristic_changed(&value).await {
                             eprintln!("   ❌ Error processing notification: {}", e);
                         }
                     }
@@ -1468,6 +1475,7 @@ impl BlueRSupport {
     }
 }
 
+#[async_trait::async_trait]
 impl BleSupport for BlueRSupport {
     fn get_characteristic(&self, uuid: &str) -> Option<CharacteristicHandle> {
         let uuid_upper = uuid.to_uppercase();
@@ -1492,7 +1500,7 @@ impl BleSupport for BlueRSupport {
         Ok(())
     }
 
-    fn write_characteristic(
+    async fn write_characteristic(
         &self,
         handle: &CharacteristicHandle,
         data: &[u8],
@@ -1513,43 +1521,13 @@ impl BleSupport for BlueRSupport {
         };
 
         if let Some(characteristic) = characteristic {
-            // Create a oneshot channel for the response
-            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-
-            // Send write request to the worker thread
-            let write_req = WriteRequest {
-                characteristic,
-                data: data.to_vec(),
-                response_tx,
-            };
-
-            self.write_tx.send(write_req).map_err(|_| {
-                garmin_v2_communicator::GarminError::BluetoothError(
-                    "Write worker thread has stopped".to_string(),
-                )
-            })?;
-
-            // Block waiting for the worker thread to complete the write
-            let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    response_rx,
-                ))
-            })
-            .map_err(|_| {
-                garmin_v2_communicator::GarminError::BluetoothError(
-                    "Write worker response channel closed".to_string(),
-                )
-            })?;
-
-            result.map_err(|e| {
+            let _result = characteristic.write(&data).await.map_err(|e| {
                 eprintln!("   ❌ BLE write failed: {}", e);
                 garmin_v2_communicator::GarminError::BluetoothError(format!(
                     "Failed to write: {}",
                     e
                 ))
             })?;
-
             println!("   ✅ BLE write completed successfully");
             Ok(())
         } else {
@@ -1639,20 +1617,12 @@ impl AsyncMessageHandler {
                     };
 
                     if let Some(communicator) = comm_ref {
-                        let msg_clone = msg.clone();
-                        match tokio::task::spawn_blocking(move || {
-                            communicator.send_message("queued_message", &msg_clone)
-                        })
-                        .await
-                        {
-                            Ok(Ok(())) => {
+                        match communicator.send_message("queued_message", &msg).await {
+                            Ok(()) => {
                                 println!("   ✅ [QUEUE] Message sent successfully");
                             }
-                            Ok(Err(e)) => {
-                                eprintln!("   ❌ [QUEUE] Failed to send message: {}", e);
-                            }
                             Err(e) => {
-                                eprintln!("   ❌ [QUEUE] Failed to spawn task: {}", e);
+                                eprintln!("   ❌ [QUEUE] Failed to send message: {}", e);
                             }
                         }
                     }
@@ -1708,12 +1678,10 @@ impl AsyncMessageHandler {
 #[async_trait::async_trait]
 impl AsyncGfdiMessageCallback for AsyncMessageHandler {
     async fn on_message(&self, message: &[u8]) -> garmin_v2_communicator::Result<Option<Vec<u8>>> {
-        // Record RX traffic for watchdog (blocking to ensure it happens immediately)
-        if let Some(watchdog) = self.watchdog.lock().unwrap().as_ref() {
-            let watchdog = watchdog.clone();
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(watchdog.record_rx());
-            });
+        // Record RX traffic for watchdog
+        let watchdog = self.watchdog.lock().unwrap().as_ref().cloned();
+        if let Some(wd) = watchdog {
+            wd.record_rx().await;
         }
 
         if message.is_empty() {
@@ -1998,12 +1966,17 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                         }
 
                         // Handle the notification control request
-                        if let Some(handler) = self.notification_handler.lock().unwrap().as_ref() {
-                            if let Err(e) = handler.on_notification_control(
-                                ctrl.notification_id,
-                                ctrl.command,
-                                &ctrl.attributes,
-                            ) {
+                        let handler_clone =
+                            self.notification_handler.lock().unwrap().as_ref().cloned();
+                        if let Some(handler) = handler_clone {
+                            if let Err(e) = handler
+                                .on_notification_control(
+                                    ctrl.notification_id,
+                                    ctrl.command,
+                                    &ctrl.attributes,
+                                )
+                                .await
+                            {
                                 eprintln!("   ❌ Failed to handle NotificationControl: {}", e);
                             }
                         } else {
@@ -2111,17 +2084,10 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
 
                             let response = wrap_in_gfdi_envelope(0x1388, &response_payload);
 
-                            match tokio::task::spawn_blocking({
-                                let comm =
-                                    self.communicator.lock().unwrap().as_ref().unwrap().clone();
-                                let msg = response.clone();
-                                move || comm.send_message("music_control_ack", &msg)
-                            })
-                            .await
-                            {
-                                Ok(Ok(_)) => println!("   ✅ MusicControlCapabilities ACK sent"),
-                                Ok(Err(e)) => eprintln!("   ❌ Failed to send ACK: {}", e),
-                                Err(e) => eprintln!("   ❌ Task spawn failed: {}", e),
+                            let comm = self.communicator.lock().unwrap().as_ref().unwrap().clone();
+                            match comm.send_message("music_control_ack", &response).await {
+                                Ok(_) => println!("   ✅ MusicControlCapabilities ACK sent"),
+                                Err(e) => eprintln!("   ❌ Failed to send ACK: {}", e),
                             }
                         }
                         // Handle Response/Status messages (0x1388 = 5000)
@@ -2197,33 +2163,28 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                                         );
 
                                         // Send the final status using the communicator
-                                        match tokio::task::spawn_blocking({
-                                            let comm = self
-                                                .communicator
-                                                .lock()
-                                                .unwrap()
-                                                .as_ref()
-                                                .unwrap()
-                                                .clone();
-                                            let msg = final_status_msg.clone();
-                                            move || comm.send_message("upload_complete", &msg)
-                                        })
-                                        .await
+                                        let comm = self
+                                            .communicator
+                                            .lock()
+                                            .unwrap()
+                                            .as_ref()
+                                            .unwrap()
+                                            .clone();
+                                        match comm
+                                            .send_message("upload_complete", &final_status_msg)
+                                            .await
                                         {
-                                            Ok(Ok(_)) => {
+                                            Ok(_) => {
                                                 println!(
                                                     "      ✅ Final status ACK sent successfully!"
                                                 );
                                                 println!("      🎉 Upload handshake complete - notification should appear on watch!");
                                             }
-                                            Ok(Err(e)) => {
+                                            Err(e) => {
                                                 eprintln!(
                                                     "      ❌ Failed to send final status ACK: {}",
                                                     e
                                                 );
-                                            }
-                                            Err(e) => {
-                                                eprintln!("      ❌ Task spawn failed: {}", e);
                                             }
                                         }
                                     } else if transfer_status == 3 {
@@ -2395,18 +2356,18 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                                                                 ) {
                                                                     Ok(response) => {
                                                                         println!("   ✅ Sending ProtobufResponse with HTTP data");
-                                                                        match tokio::task::spawn_blocking({
-                                                                            let comm = self.communicator.lock().unwrap().as_ref().unwrap().clone();
-                                                                            let data = response.clone();
-                                                                            move || comm.send_message("http_response", &data)
-                                                                        })
-                                                                        .await
-                                                                        {
-                                                                            Ok(Ok(_)) => {
+                                                                        let comm = self
+                                                                            .communicator
+                                                                            .lock()
+                                                                            .unwrap()
+                                                                            .as_ref()
+                                                                            .unwrap()
+                                                                            .clone();
+                                                                        match comm.send_message("http_response", &response).await {
+                                                                            Ok(_) => {
                                                                                 println!("   ✅ HTTP response sent successfully!")
                                                                             }
-                                                                            Ok(Err(e)) => eprintln!("   ❌ Failed to send HTTP response: {}", e),
-                                                                            Err(e) => eprintln!("   ❌ Task spawn failed: {}", e),
+                                                                            Err(e) => eprintln!("   ❌ Failed to send HTTP response: {}", e),
                                                                         }
                                                                     }
                                                                     Err(e) => {
@@ -2689,33 +2650,25 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
 
                                                         println!("   📤 Sending DataTransfer chunk response ({} bytes)", message.len());
 
-                                                        match tokio::task::spawn_blocking({
-                                                            let comm = self
-                                                                .communicator
-                                                                .lock()
-                                                                .unwrap()
-                                                                .as_ref()
-                                                                .unwrap()
-                                                                .clone();
-                                                            let data = message.clone();
-                                                            move || {
-                                                                comm.send_message(
-                                                                    "data_transfer_chunk",
-                                                                    &data,
-                                                                )
-                                                            }
-                                                        })
-                                                        .await
+                                                        let comm = self
+                                                            .communicator
+                                                            .lock()
+                                                            .unwrap()
+                                                            .as_ref()
+                                                            .unwrap()
+                                                            .clone();
+                                                        match comm
+                                                            .send_message(
+                                                                "data_transfer_chunk",
+                                                                &message,
+                                                            )
+                                                            .await
                                                         {
-                                                            Ok(Ok(_)) => println!(
+                                                            Ok(_) => println!(
                                                                 "   ✅ DataTransfer chunk sent"
                                                             ),
-                                                            Ok(Err(e)) => eprintln!(
-                                                                "   ❌ Failed to send chunk: {}",
-                                                                e
-                                                            ),
                                                             Err(e) => eprintln!(
-                                                                "   ❌ Task spawn failed: {}",
+                                                                "   ❌ Failed to send chunk: {}",
                                                                 e
                                                             ),
                                                         }
@@ -2739,33 +2692,22 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                                                             &response_payload,
                                                         );
 
-                                                        match tokio::task::spawn_blocking({
-                                                            let comm = self
-                                                                .communicator
-                                                                .lock()
-                                                                .unwrap()
-                                                                .as_ref()
-                                                                .unwrap()
-                                                                .clone();
-                                                            let data = response.clone();
-                                                            move || {
-                                                                comm.send_message(
-                                                                    "data_transfer_error",
-                                                                    &data,
-                                                                )
-                                                            }
-                                                        })
-                                                        .await
+                                                        let comm = self
+                                                            .communicator
+                                                            .lock()
+                                                            .unwrap()
+                                                            .as_ref()
+                                                            .unwrap()
+                                                            .clone();
+                                                        match comm
+                                                            .send_message("data_transfer_error", &response)
+                                                            .await
                                                         {
-                                                            Ok(Ok(_)) => println!(
-                                                                "   ✅ Error response sent"
-                                                            ),
-                                                            Ok(Err(e)) => eprintln!(
-                                                                "   ❌ Failed to send error: {}",
-                                                                e
+                                                            Ok(_) => println!(
+                                                                "   ✅ DataTransfer error response sent"
                                                             ),
                                                             Err(e) => eprintln!(
-                                                                "   ❌ Task spawn failed: {}",
+                                                                "   ❌ Failed to send error: {}",
                                                                 e
                                                             ),
                                                         }
@@ -3703,7 +3645,7 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
 
     // First, just find and set up the characteristics (don't send requests yet)
     println!("\n5️⃣  Finding Garmin ML characteristics...");
-    let init_result = match communicator.initialize_device() {
+    let init_result = match communicator.initialize_device().await {
         Ok(true) => {
             println!("   ✅ Characteristics found and set up!");
             true
@@ -3732,7 +3674,7 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
     // NOW start the notification listener - characteristics are set up
     // CRITICAL: Must be active BEFORE we re-send requests
     println!("\n6️⃣  Starting notification listener...");
-    let receive_uuid = communicator.get_receive_characteristic_uuid();
+    let receive_uuid = communicator.get_receive_characteristic_uuid().await;
 
     if let Some(uuid) = receive_uuid {
         println!("   Using receive characteristic: {}", &uuid[..20]);
@@ -3761,7 +3703,7 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
 
     // NOW re-initialize to send requests - listener will catch responses!
     println!("\n7️⃣  Re-initializing to send requests (listener is ready)...");
-    match communicator.initialize_device() {
+    match communicator.initialize_device().await {
         Ok(true) => {
             println!("   ✅ CLOSE_ALL_REQ sent");
             println!("   ✅ REGISTER_ML_REQ sent");
@@ -3935,10 +3877,11 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
         loop {
             tokio::time::sleep(Duration::from_secs(15)).await;
 
-            if let Some(reason) = watchdog_for_reconnect
+            let reason = watchdog_for_reconnect
                 .check_reconnect_needed_sync(&ble_for_reconnect.device)
-                .await
-            {
+                .await;
+
+            if let Some(reason) = reason {
                 eprintln!(
                 "   📡 Will attempt reconnection due to {reason} while continuing to monitor notifications..."
             );
@@ -3951,7 +3894,7 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
 
                 // Immediately pause MLR to prevent any sends during reconnection
                 eprintln!("   ⏸️  Pausing MLR to stop all sends during reconnection...");
-                communicator_for_reconnect.clear_and_pause_mlr();
+                communicator_for_reconnect.clear_and_pause_mlr().await;
 
                 // Clean disconnect
                 if let Ok(true) = ble_for_reconnect.device.is_connected().await {
@@ -3996,7 +3939,7 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                             println!(
                                 "\n7️⃣  Re-initializing to send requests (listener is ready)..."
                             );
-                            match communicator_for_reconnect.initialize_device() {
+                            match communicator_for_reconnect.initialize_device().await {
                                 Ok(true) => {
                                     println!("   ✅ CLOSE_ALL_REQ sent");
                                     println!("   ✅ REGISTER_ML_REQ sent");
@@ -4018,7 +3961,7 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
 
                             // Resume MLR operations after successful reconnection
                             eprintln!("   ▶️  Resuming MLR operations...");
-                            communicator_for_reconnect.resume_mlr();
+                            communicator_for_reconnect.resume_mlr().await;
 
                             // Mark as connected
                             watchdog_for_reconnect.mark_connected().await;

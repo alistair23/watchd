@@ -274,15 +274,26 @@ impl WatchdogManager {
 
         println!("watchdog: Checking if reconnect is required");
 
-        let state = match self.state.try_lock() {
-            Ok(s) => s,
-            Err(_) => panic!("Failed to lock"),
-        };
+        // Extract needed data without holding the lock across await
+        let (is_reconnecting, health_status, last_rx, rx_timeout) = {
+            let state = match self.state.try_lock() {
+                Ok(s) => s,
+                Err(_) => {
+                    // If we can't get the lock, skip this check
+                    return None;
+                }
+            };
 
-        let now = Instant::now();
+            (
+                state.is_reconnecting,
+                state.health_status,
+                state.last_rx,
+                self.config.rx_timeout,
+            )
+        }; // MutexGuard dropped here
 
         // Don't reconnect if already reconnecting
-        if state.is_reconnecting {
+        if is_reconnecting {
             return None;
         }
 
@@ -291,14 +302,15 @@ impl WatchdogManager {
         }
 
         // Check internal health status first (set by mark_disconnected)
-        if state.health_status == HealthStatus::Disconnected {
+        if health_status == HealthStatus::Disconnected {
             return Some("Connection lost (marked disconnected)".to_string());
         }
 
         // Check RX timeout
-        if let Some(last_rx) = state.last_rx {
+        if let Some(last_rx) = last_rx {
+            let now = Instant::now();
             let elapsed = now.duration_since(last_rx);
-            if elapsed >= self.config.rx_timeout {
+            if elapsed >= rx_timeout {
                 return Some(format!("No RX traffic for {} seconds", elapsed.as_secs()));
             }
         }

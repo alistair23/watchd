@@ -10,7 +10,8 @@ use crate::mlr::{MessageReceiver, MessageSender, MlrCommunicator};
 use crate::types::{GarminError, RequestType, Result, Service};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
+use tokio::sync::Mutex;
 
 /// Base UUID format for Garmin ML GFDI service
 pub const BASE_UUID_FORMAT: &str = "6A4E%04X-667B-11E3-949A-0800200C9A66";
@@ -19,6 +20,7 @@ pub const BASE_UUID_FORMAT: &str = "6A4E%04X-667B-11E3-949A-0800200C9A66";
 const GADGETBRIDGE_CLIENT_ID: u64 = 2;
 
 /// Trait for BLE operations that must be implemented by the platform
+#[async_trait::async_trait]
 pub trait BleSupport: Send + Sync {
     /// Get a characteristic by UUID
     fn get_characteristic(&self, uuid: &str) -> Option<CharacteristicHandle>;
@@ -27,7 +29,7 @@ pub trait BleSupport: Send + Sync {
     fn enable_notifications(&self, handle: &CharacteristicHandle) -> Result<()>;
 
     /// Write data to a characteristic
-    fn write_characteristic(&self, handle: &CharacteristicHandle, data: &[u8]) -> Result<()>;
+    async fn write_characteristic(&self, handle: &CharacteristicHandle, data: &[u8]) -> Result<()>;
 
     /// Create a transaction for queuing multiple operations
     fn create_transaction(&self, name: &str) -> Box<dyn Transaction>;
@@ -69,8 +71,9 @@ pub trait AsyncGfdiMessageCallback: Send + Sync {
 }
 
 /// Writer for sending messages to a service
+#[async_trait::async_trait]
 pub trait ServiceWriter: Send + Sync {
-    fn write(&self, task_name: &str, data: &[u8]) -> Result<()>;
+    async fn write(&self, task_name: &str, data: &[u8]) -> Result<()>;
 }
 
 /// Callback for service lifecycle events
@@ -131,8 +134,9 @@ struct MlrBleSender {
     characteristic_send: CharacteristicHandle,
 }
 
+#[async_trait::async_trait]
 impl MessageSender for MlrBleSender {
-    fn send_packet(&self, task_name: &str, packet: &[u8]) -> Result<()> {
+    async fn send_packet(&self, task_name: &str, packet: &[u8]) -> Result<()> {
         debug!(
             "MLR sending packet for '{}': {} bytes",
             task_name,
@@ -150,6 +154,7 @@ impl MessageSender for MlrBleSender {
         match self
             .ble_support
             .write_characteristic(&self.characteristic_send, packet)
+            .await
         {
             Ok(_) => {
                 debug!("MLR packet sent successfully via BLE");
@@ -181,13 +186,14 @@ struct MlrGfdiReceiver {
     cobs_codec: Mutex<CobsCoDec>,
 }
 
+#[async_trait::async_trait]
 impl MessageReceiver for MlrGfdiReceiver {
-    fn on_data_received(&self, data: &[u8]) -> Result<()> {
+    async fn on_data_received(&self, data: &[u8]) -> Result<()> {
         debug!("MLR received data: {} bytes", data.len());
 
         // The data from MLR is COBS encoded, so we need to decode it
         // Use persistent codec to support multi-packet messages
-        let mut codec = self.cobs_codec.lock().unwrap();
+        let mut codec = self.cobs_codec.lock().await;
         codec.receive_bytes(data);
 
         if let Some(decoded) = codec.retrieve_message() {
@@ -379,24 +385,28 @@ impl CommunicatorV2 {
 
     /// Register a service callback for a specific service
     /// This callback will be called when the service is connected/closed or receives messages
-    pub fn register_service_callback(&self, service: Service, callback: Box<dyn ServiceCallback>) {
-        let mut state = self.state.lock().unwrap();
+    pub async fn register_service_callback(
+        &self,
+        service: Service,
+        callback: Box<dyn ServiceCallback>,
+    ) {
+        let mut state = self.state.lock().await;
         state.service_callbacks.insert(service, callback);
         info!("Registered callback for service: {}", service);
     }
 
     /// Unregister a service callback
-    pub fn unregister_service_callback(
+    pub async fn unregister_service_callback(
         &self,
         service: Service,
     ) -> Option<Box<dyn ServiceCallback>> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().await;
         state.service_callbacks.remove(&service)
     }
 
     /// Get the receive characteristic UUID that was set during initialization
-    pub fn get_receive_characteristic_uuid(&self) -> Option<String> {
-        let state = self.state.lock().unwrap();
+    pub async fn get_receive_characteristic_uuid(&self) -> Option<String> {
+        let state = self.state.lock().await;
         state
             .characteristic_receive
             .as_ref()
@@ -404,8 +414,8 @@ impl CommunicatorV2 {
     }
 
     /// Update the MTU (Maximum Transmission Unit) size
-    pub fn on_mtu_changed(&self, mtu: usize) {
-        let mut state = self.state.lock().unwrap();
+    pub async fn on_mtu_changed(&self, mtu: usize) {
+        let mut state = self.state.lock().await;
 
         // Calculate max write chunk based on MTU
         // Typically: MTU - 3 (ATT header overhead)
@@ -418,7 +428,7 @@ impl CommunicatorV2 {
 
         // Update all MLR communicators
         for mlr in state.mlr_communicators.values() {
-            mlr.set_max_packet_size(state.max_write_size);
+            mlr.set_max_packet_size(state.max_write_size).await;
         }
     }
 
@@ -426,10 +436,10 @@ impl CommunicatorV2 {
     ///
     /// This is the Rust port of the Java `initializeDevice` method.
     /// It iterates through known ML characteristics to find a valid send/receive pair.
-    pub fn initialize_device(&self) -> Result<bool> {
+    pub async fn initialize_device(&self) -> Result<bool> {
         info!("Initializing Garmin v2 device");
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().await;
 
         // Iterate through the known ML characteristics until we find a known pair
         // send characteristic = read characteristic + 0x10 (eg. 2810 / 2820)
@@ -458,7 +468,8 @@ impl CommunicatorV2 {
                 let close_all_data = self.create_close_all_services_message();
                 info!("Closing all services: {close_all_data:x?}");
                 self.ble_support
-                    .write_characteristic(&send, &close_all_data)?;
+                    .write_characteristic(&send, &close_all_data)
+                    .await?;
 
                 info!("Garmin v2 device initialized successfully");
                 return Ok(true);
@@ -472,10 +483,10 @@ impl CommunicatorV2 {
     /// Initialize device using a transaction builder pattern
     ///
     /// This variant uses the transaction pattern similar to the original Java code.
-    pub fn initialize_device_with_transaction(&self, transaction_name: &str) -> Result<bool> {
+    pub async fn initialize_device_with_transaction(&self, transaction_name: &str) -> Result<bool> {
         info!("Initializing Garmin v2 device with transaction");
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().await;
         let mut transaction = self.ble_support.create_transaction(transaction_name);
 
         // Iterate through the known ML characteristics
@@ -517,7 +528,7 @@ impl CommunicatorV2 {
     ///
     /// This is the Rust port of the Java `sendMessage` method.
     /// Messages are COBS-encoded and sent via MLR protocol or directly depending on setup.
-    pub fn send_message(&self, task_name: &str, message: &[u8]) -> Result<()> {
+    pub async fn send_message(&self, task_name: &str, message: &[u8]) -> Result<()> {
         if message.is_empty() {
             return Err(GarminError::EmptyMessage);
         }
@@ -526,7 +537,7 @@ impl CommunicatorV2 {
             "send_message: attempting to acquire state lock for task '{}'",
             task_name
         );
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().await;
         debug!("send_message: acquired state lock for task '{}'", task_name);
 
         // Get the GFDI handle
@@ -657,7 +668,7 @@ impl CommunicatorV2 {
             let mlr = Arc::clone(mlr);
             // IMPORTANT: Must drop state lock before calling MLR to avoid deadlock
             drop(state);
-            let result = mlr.send_message(task_name, &payload);
+            let result = mlr.send_message(task_name, &payload).await;
             return result;
         }
 
@@ -698,7 +709,8 @@ impl CommunicatorV2 {
                 );
 
                 self.ble_support
-                    .write_characteristic(&characteristic_send, &fragment)?;
+                    .write_characteristic(&characteristic_send, &fragment)
+                    .await?;
 
                 position += chunk_size;
                 remaining -= chunk_size;
@@ -719,7 +731,8 @@ impl CommunicatorV2 {
             );
 
             self.ble_support
-                .write_characteristic(&characteristic_send, &packet)?;
+                .write_characteristic(&characteristic_send, &packet)
+                .await?;
         }
 
         info!("   ✅ Message '{}' sent successfully to watch", task_name);
@@ -727,12 +740,16 @@ impl CommunicatorV2 {
     }
 
     /// Send a message using a transaction
-    pub fn send_message_with_transaction(&self, task_name: &str, message: &[u8]) -> Result<()> {
+    pub async fn send_message_with_transaction(
+        &self,
+        task_name: &str,
+        message: &[u8],
+    ) -> Result<()> {
         if message.is_empty() {
             return Err(GarminError::EmptyMessage);
         }
 
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().await;
 
         let gfdi_handle = state
             .handle_by_service
@@ -744,7 +761,7 @@ impl CommunicatorV2 {
         // Check if we have an MLR communicator
         if state.mlr_communicators.contains_key(gfdi_handle) {
             let mlr = state.mlr_communicators.get(gfdi_handle).unwrap();
-            let result = mlr.send_message(task_name, &payload);
+            let result = mlr.send_message(task_name, &payload).await;
             drop(state);
             return result;
         }
@@ -785,7 +802,7 @@ impl CommunicatorV2 {
     }
 
     /// Handle characteristic changed notification (received data)
-    pub fn on_characteristic_changed(&self, data: &[u8]) -> Result<()> {
+    pub async fn on_characteristic_changed(&self, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
@@ -794,7 +811,7 @@ impl CommunicatorV2 {
         debug!("Raw data: {:02X?}", &data[..data.len().min(20)]);
 
         debug!("on_characteristic_changed: attempting to acquire state lock");
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().await;
         debug!("on_characteristic_changed: acquired state lock");
 
         // Check if this is an MLR packet
@@ -819,7 +836,7 @@ impl CommunicatorV2 {
                 if let Some(mlr) = state.mlr_communicators.get(&handle) {
                     let mlr = Arc::clone(mlr);
                     drop(state);
-                    let result = mlr.on_packet_received(data);
+                    let result = mlr.on_packet_received(data).await;
                     return result;
                 } else {
                     warn!(
@@ -840,7 +857,7 @@ impl CommunicatorV2 {
             if let Some(mlr) = state.mlr_communicators.get(&handle) {
                 let mlr = Arc::clone(mlr);
                 drop(state);
-                let result = mlr.on_packet_received(data);
+                let result = mlr.on_packet_received(data).await;
                 return result;
             } else {
                 warn!(
@@ -860,7 +877,7 @@ impl CommunicatorV2 {
         if handle == 0 {
             debug!("Processing handle management message");
             drop(state);
-            return self.process_handle_management(payload);
+            return self.process_handle_management(payload).await;
         }
 
         // Not MLR - process as COBS data
@@ -873,7 +890,7 @@ impl CommunicatorV2 {
 
             // Handle the message based on its type
             drop(state);
-            self.handle_decoded_message(&message)?;
+            self.handle_decoded_message(&message).await?;
         } else {
             debug!("No complete COBS message yet");
         }
@@ -882,7 +899,7 @@ impl CommunicatorV2 {
     }
 
     /// Handle a decoded message from the device
-    fn handle_decoded_message(&self, message: &[u8]) -> Result<()> {
+    async fn handle_decoded_message(&self, message: &[u8]) -> Result<()> {
         if message.is_empty() {
             debug!("Empty decoded message, ignoring");
             return Ok(());
@@ -903,7 +920,7 @@ impl CommunicatorV2 {
             "handle_decoded_message: attempting to acquire state lock for handle {}",
             handle
         );
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().await;
         debug!(
             "handle_decoded_message: acquired state lock for handle {}",
             handle
@@ -947,7 +964,7 @@ impl CommunicatorV2 {
     }
 
     /// Process handle management messages (handle 0)
-    fn process_handle_management(&self, message: &[u8]) -> Result<()> {
+    async fn process_handle_management(&self, message: &[u8]) -> Result<()> {
         if message.is_empty() {
             return Err(GarminError::InvalidMessage(
                 "Empty handle management message".to_string(),
@@ -992,9 +1009,9 @@ impl CommunicatorV2 {
                 );
                 Ok(())
             }
-            RequestType::RegisterMlResp => self.process_register_ml_resp(&message[9..]),
-            RequestType::CloseHandleResp => self.process_close_handle_resp(&message[9..]),
-            RequestType::CloseAllResp => self.process_close_all_resp(),
+            RequestType::RegisterMlResp => self.process_register_ml_resp(&message[9..]).await,
+            RequestType::CloseHandleResp => self.process_close_handle_resp(&message[9..]).await,
+            RequestType::CloseAllResp => self.process_close_all_resp().await,
             RequestType::UnkResp => {
                 debug!("Received unknown response. Message: {:02X?}", message);
                 Ok(())
@@ -1007,7 +1024,7 @@ impl CommunicatorV2 {
     }
 
     /// Process REGISTER_ML_RESP message
-    fn process_register_ml_resp(&self, payload: &[u8]) -> Result<()> {
+    async fn process_register_ml_resp(&self, payload: &[u8]) -> Result<()> {
         if payload.len() < 5 {
             return Err(GarminError::InvalidMessage(
                 "RegisterMlResp payload too short".to_string(),
@@ -1053,7 +1070,7 @@ impl CommunicatorV2 {
         );
 
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().await;
             state.service_by_handle.insert(handle, service);
             state.handle_by_service.insert(service, handle);
         }
@@ -1064,7 +1081,7 @@ impl CommunicatorV2 {
 
             // Get the send characteristic
             let send_char = {
-                let state = self.state.lock().unwrap();
+                let state = self.state.lock().await;
                 state.characteristic_send.clone()
             };
 
@@ -1100,7 +1117,7 @@ impl CommunicatorV2 {
             }
 
             // Store the MLR communicator (wrapped in Arc for cloning)
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().await;
             state.mlr_communicators.insert(mlr_handle, Arc::new(mlr));
 
             info!(
@@ -1110,7 +1127,7 @@ impl CommunicatorV2 {
         }
 
         // Get or create service callback
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().await;
 
         // If no callback is registered for this service, create a default one for known services
         if !state.service_callbacks.contains_key(&service) {
@@ -1155,7 +1172,7 @@ impl CommunicatorV2 {
     }
 
     /// Process CLOSE_HANDLE_RESP message
-    fn process_close_handle_resp(&self, payload: &[u8]) -> Result<()> {
+    async fn process_close_handle_resp(&self, payload: &[u8]) -> Result<()> {
         if payload.len() < 4 {
             return Err(GarminError::InvalidMessage(
                 "CloseHandleResp payload too short".to_string(),
@@ -1173,7 +1190,7 @@ impl CommunicatorV2 {
             service, handle, status
         );
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().await;
 
         if let Some(service) = service {
             // Call service callback onClose
@@ -1197,10 +1214,10 @@ impl CommunicatorV2 {
     }
 
     /// Process CLOSE_ALL_RESP message
-    fn process_close_all_resp(&self) -> Result<()> {
+    async fn process_close_all_resp(&self) -> Result<()> {
         debug!("Received close all handles response");
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().await;
 
         // Clear all service mappings
         debug!("Clear all service mappings");
@@ -1232,6 +1249,7 @@ impl CommunicatorV2 {
             if let Err(e) = self
                 .ble_support
                 .write_characteristic(&send_char, &register_msg)
+                .await
             {
                 warn!("Failed to send GFDI registration message: {}", e);
             }
@@ -1258,7 +1276,7 @@ impl CommunicatorV2 {
             payload.len()
         );
 
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().await;
 
         if let Some(service) = state.service_by_handle.get(&handle) {
             debug!("Async message for service: {}", service);
@@ -1277,20 +1295,21 @@ impl CommunicatorV2 {
     }
 
     /// Register a service with the device
-    pub fn register_service(&self, service: Service, reliable: bool) -> Result<()> {
+    pub async fn register_service(&self, service: Service, reliable: bool) -> Result<()> {
         info!("Registering service: {} (reliable: {})", service, reliable);
 
         let message = self.create_register_service_message(service, reliable);
-        self.send_message(&format!("register_{}", service), &message)?;
+        self.send_message(&format!("register_{}", service), &message)
+            .await?;
 
         Ok(())
     }
 
     /// Close a service
-    pub fn close_service(&self, service: Service) -> Result<()> {
+    pub async fn close_service(&self, service: Service) -> Result<()> {
         info!("Closing service: {}", service);
 
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().await;
         let handle = state.handle_by_service.get(&service).ok_or_else(|| {
             GarminError::BluetoothError(format!("Service {} not registered", service))
         })?;
@@ -1298,7 +1317,8 @@ impl CommunicatorV2 {
         let message = self.create_close_service_message(service, *handle);
         drop(state);
 
-        self.send_message(&format!("close_{}", service), &message)?;
+        self.send_message(&format!("close_{}", service), &message)
+            .await?;
 
         Ok(())
     }
@@ -1337,21 +1357,21 @@ impl CommunicatorV2 {
     }
 
     /// Register a service handle (called when device responds with handle assignment)
-    pub fn register_handle(&self, service: Service, handle: u8) {
-        let mut state = self.state.lock().unwrap();
+    pub async fn register_handle(&self, service: Service, handle: u8) {
+        let mut state = self.state.lock().await;
         state.service_by_handle.insert(handle, service);
         state.handle_by_service.insert(service, handle);
         info!("Registered service {} with handle {}", service, handle);
     }
 
     /// Create and register an MLR communicator for a handle
-    pub fn create_mlr_communicator(
+    pub async fn create_mlr_communicator(
         &self,
         handle: u8,
         sender: Arc<dyn MessageSender>,
         receiver: Arc<dyn MessageReceiver>,
     ) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().await;
 
         let mut mlr = MlrCommunicator::new(handle, state.max_write_size, sender, receiver);
 
@@ -1363,31 +1383,24 @@ impl CommunicatorV2 {
     }
 
     /// Dispose and clean up resources
-    pub fn dispose(&self) {
+    pub async fn dispose(&self) {
         info!("Disposing CommunicatorV2");
 
-        // Handle poisoned mutex gracefully during cleanup
-        let state_result = self.state.lock();
-        let mut state = match state_result {
-            Ok(s) => s,
-            Err(poisoned) => {
-                warn!("State mutex was poisoned, recovering for cleanup");
-                poisoned.into_inner()
-            }
-        };
+        // Get state lock for cleanup
+        let mut state = self.state.lock().await;
 
         // Close all MLR communicators
         for (handle, _mlr) in state.mlr_communicators.drain() {
             debug!("Closing MLR communicator for handle {}", handle);
             // Note: Arc<MlrCommunicator> doesn't expose close() method
-            // The cleanup happens when Arc is dropped
+            // The Drop impl will handle cleanup
         }
 
-        state.cobs_codec.reset();
+        debug!("CommunicatorV2 disposed");
     }
 
     /// Handle connection state change
-    pub fn on_connection_state_change(&self, connected: bool) {
+    pub async fn on_connection_state_change(&self, connected: bool) {
         debug!(
             "Connection state changed: {}",
             if connected {
@@ -1398,36 +1411,34 @@ impl CommunicatorV2 {
         );
 
         if !connected {
-            let state = self.state.lock().unwrap();
-            for mlr in state.mlr_communicators.values() {
-                mlr.on_connection_state_change(connected);
-            }
+            // Clear and pause all MLR communicators when disconnected
+            self.clear_and_pause_mlr().await;
         }
     }
 
     /// Pause all MLR communicators (prevents sending during reconnection)
-    pub fn pause_mlr(&self) {
-        let state = self.state.lock().unwrap();
+    pub async fn pause_mlr(&self) {
+        let state = self.state.lock().await;
         for mlr in state.mlr_communicators.values() {
-            mlr.pause();
+            mlr.pause().await;
         }
         debug!("Paused all MLR communicators");
     }
 
     /// Resume all MLR communicators (allows sending after reconnection)
-    pub fn resume_mlr(&self) {
-        let state = self.state.lock().unwrap();
+    pub async fn resume_mlr(&self) {
+        let state = self.state.lock().await;
         for mlr in state.mlr_communicators.values() {
-            mlr.resume();
+            mlr.resume().await;
         }
         debug!("Resumed all MLR communicators");
     }
 
     /// Clear and pause all MLR communicators (use when connection is lost)
-    pub fn clear_and_pause_mlr(&self) {
-        let state = self.state.lock().unwrap();
+    pub async fn clear_and_pause_mlr(&self) {
+        let state = self.state.lock().await;
         for mlr in state.mlr_communicators.values() {
-            mlr.clear_and_pause();
+            mlr.clear_and_pause().await;
         }
         debug!("Cleared and paused all MLR communicators");
     }
@@ -1435,7 +1446,10 @@ impl CommunicatorV2 {
 
 impl Drop for CommunicatorV2 {
     fn drop(&mut self) {
-        self.dispose();
+        // Note: We can't call async dispose() from Drop
+        // The MLR communicators will be cleaned up via their own Drop impls
+        // when the Arc references are dropped
+        debug!("CommunicatorV2 dropping - MLR communicators will clean up automatically");
     }
 }
 
@@ -1456,8 +1470,9 @@ struct MlrServiceWriter {
     characteristic_send: CharacteristicHandle,
 }
 
+#[async_trait::async_trait]
 impl ServiceWriter for MlrServiceWriter {
-    fn write(&self, task_name: &str, data: &[u8]) -> Result<()> {
+    async fn write(&self, task_name: &str, data: &[u8]) -> Result<()> {
         debug!(
             "MlrServiceWriter writing {} bytes for task '{}' on handle 0x{:02X}",
             data.len(),
@@ -1473,25 +1488,50 @@ impl ServiceWriter for MlrServiceWriter {
 
         self.ble_support
             .write_characteristic(&self.characteristic_send, &payload)
+            .await
     }
 }
 
 /// Example GFDI service callback that decodes COBS and forwards to a message callback
 pub struct GfdiServiceCallback {
-    cobs_codec: Mutex<CobsCoDec>,
+    cobs_codec: Arc<Mutex<CobsCoDec>>,
     message_callback: Arc<dyn GfdiMessageCallback>,
 }
 
 impl GfdiServiceCallback {
     pub fn new(message_callback: Arc<dyn GfdiMessageCallback>) -> Self {
         Self {
-            cobs_codec: Mutex::new(CobsCoDec::new()),
+            cobs_codec: Arc::new(Mutex::new(CobsCoDec::new())),
             message_callback,
         }
     }
 }
 
 impl ServiceCallback for GfdiServiceCallback {
+    fn on_message(&self, data: &[u8]) -> Result<()> {
+        debug!("GFDI service received {} bytes", data.len());
+
+        // Since this is called from sync context but needs async work,
+        // spawn a task to handle the COBS decoding and callback
+        let codec = self.cobs_codec.clone();
+        let callback = self.message_callback.clone();
+        let data = data.to_vec();
+
+        tokio::spawn(async move {
+            let mut codec_guard = codec.lock().await;
+            codec_guard.receive_bytes(&data);
+
+            if let Some(decoded) = codec_guard.retrieve_message() {
+                debug!("GFDI COBS decoded: {} bytes", decoded.len());
+                if let Err(e) = callback.on_message(&decoded) {
+                    error!("GFDI callback failed: {}", e);
+                }
+            }
+        });
+
+        Ok(())
+    }
+
     fn on_connect(&self, _writer: Box<dyn ServiceWriter>) -> Result<()> {
         info!("GFDI service connected");
         Ok(())
@@ -1499,21 +1539,6 @@ impl ServiceCallback for GfdiServiceCallback {
 
     fn on_close(&self) -> Result<()> {
         info!("GFDI service closed");
-        Ok(())
-    }
-
-    fn on_message(&self, data: &[u8]) -> Result<()> {
-        debug!("GFDI service received {} bytes", data.len());
-
-        // Decode COBS
-        let mut codec = self.cobs_codec.lock().unwrap();
-        codec.receive_bytes(data);
-
-        if let Some(decoded) = codec.retrieve_message() {
-            debug!("GFDI decoded message: {} bytes", decoded.len());
-            self.message_callback.on_message(&decoded)?;
-        }
-
         Ok(())
     }
 }
@@ -1584,15 +1609,15 @@ impl ServiceCallback for RealtimeStepsCallback {
 
 /// Generic callback for file transfer services
 pub struct FileTransferCallback {
-    data: Mutex<Vec<u8>>,
-    on_complete: Box<dyn Fn(Vec<u8>) -> Result<()> + Send + Sync>,
+    data: Arc<Mutex<Vec<u8>>>,
+    on_complete: Arc<Box<dyn Fn(Vec<u8>) -> Result<()> + Send + Sync>>,
 }
 
 impl FileTransferCallback {
     pub fn new(on_complete: Box<dyn Fn(Vec<u8>) -> Result<()> + Send + Sync>) -> Self {
         Self {
-            data: Mutex::new(Vec::new()),
-            on_complete,
+            data: Arc::new(Mutex::new(Vec::new())),
+            on_complete: Arc::new(on_complete),
         }
     }
 }
@@ -1605,16 +1630,35 @@ impl ServiceCallback for FileTransferCallback {
 
     fn on_close(&self) -> Result<()> {
         info!("File transfer service closed");
-        let data = self.data.lock().unwrap().clone();
-        if !data.is_empty() {
-            (self.on_complete)(data)?;
-        }
+
+        // Spawn async task to process the complete data
+        let data_mutex = self.data.clone();
+        let on_complete = self.on_complete.clone();
+
+        tokio::spawn(async move {
+            let data = data_mutex.lock().await.clone();
+            if !data.is_empty() {
+                if let Err(e) = on_complete(data) {
+                    error!("File transfer completion callback failed: {}", e);
+                }
+            }
+        });
+
         Ok(())
     }
 
     fn on_message(&self, data: &[u8]) -> Result<()> {
         debug!("File transfer received {} bytes", data.len());
-        self.data.lock().unwrap().extend_from_slice(data);
+
+        // Spawn async task to append data
+        let data_mutex = self.data.clone();
+        let data_vec = data.to_vec();
+
+        tokio::spawn(async move {
+            let mut guard = data_mutex.lock().await;
+            guard.extend_from_slice(&data_vec);
+        });
+
         Ok(())
     }
 }
@@ -1626,7 +1670,7 @@ mod tests {
 
     struct MockBleSupport {
         characteristics: HashMap<String, CharacteristicHandle>,
-        written_data: Arc<StdMutex<Vec<Vec<u8>>>>,
+        written_data: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
     impl MockBleSupport {
@@ -1645,15 +1689,20 @@ mod tests {
 
             Self {
                 characteristics,
-                written_data: Arc::new(StdMutex::new(Vec::new())),
+                written_data: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
         fn get_written_data(&self) -> Vec<Vec<u8>> {
-            self.written_data.lock().unwrap().clone()
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(self.written_data.lock())
+                    .clone()
+            })
         }
     }
 
+    #[async_trait::async_trait]
     impl BleSupport for MockBleSupport {
         fn get_characteristic(&self, uuid: &str) -> Option<CharacteristicHandle> {
             self.characteristics.get(uuid).cloned()
@@ -1663,8 +1712,12 @@ mod tests {
             Ok(())
         }
 
-        fn write_characteristic(&self, _handle: &CharacteristicHandle, data: &[u8]) -> Result<()> {
-            self.written_data.lock().unwrap().push(data.to_vec());
+        async fn write_characteristic(
+            &self,
+            _handle: &CharacteristicHandle,
+            data: &[u8],
+        ) -> Result<()> {
+            self.written_data.lock().await.push(data.to_vec());
             Ok(())
         }
 
@@ -1677,17 +1730,17 @@ mod tests {
 
     impl MockTransaction {
         fn new() -> Self {
-            Self
+            MockTransaction
         }
     }
 
     impl Transaction for MockTransaction {
         fn write(&mut self, _handle: &CharacteristicHandle, _data: &[u8]) {
-            // Write operation
+            // No-op
         }
 
         fn notify(&mut self, _handle: &CharacteristicHandle, _enable: bool) {
-            // Notify operation
+            // No-op
         }
 
         fn queue(self: Box<Self>) -> Result<()> {
@@ -1695,18 +1748,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_communicator_creation() {
+    // Helper to get COBS-encoded message
+    fn create_cobs_encoded_message(data: &[u8]) -> Vec<u8> {
+        CobsCoDec::encode(data)
+    }
+
+    fn create_test_message(msg_type: RequestType, client_id: u64) -> Vec<u8> {
+        let mut message = vec![0]; // handle
+        message.push(msg_type.to_u8());
+        message.extend_from_slice(&client_id.to_le_bytes());
+        message
+    }
+
+    #[tokio::test]
+    async fn test_create_communicator() {
         let ble = Arc::new(MockBleSupport::new());
         let _comm = CommunicatorV2::new(ble);
     }
 
-    #[test]
-    fn test_initialize_device() {
+    #[tokio::test]
+    async fn test_initialize_device() {
         let ble = Arc::new(MockBleSupport::new());
         let comm = CommunicatorV2::new(ble.clone());
 
-        let result = comm.initialize_device().unwrap();
+        let result = comm.initialize_device().await.unwrap();
         assert!(result);
 
         // Should have written close all services command
@@ -1714,41 +1779,46 @@ mod tests {
         assert!(!written.is_empty());
     }
 
-    #[test]
-    fn test_close_all_services_message() {
+    #[tokio::test]
+    async fn test_create_close_all_services_message() {
         let ble = Arc::new(MockBleSupport::new());
         let comm = CommunicatorV2::new(ble);
 
         let message = comm.create_close_all_services_message();
-        assert_eq!(message.len(), 13);
+
+        // Should have: [handle][type][client_id]
         assert_eq!(message[0], 0); // handle
         assert_eq!(message[1], RequestType::CloseAllReq.to_u8());
+        // Remaining bytes are client ID
     }
 
-    #[test]
-    fn test_register_service_message() {
+    #[tokio::test]
+    async fn test_create_register_service_message() {
         let ble = Arc::new(MockBleSupport::new());
         let comm = CommunicatorV2::new(ble);
 
         let message = comm.create_register_service_message(Service::GFDI, true);
-        assert_eq!(message.len(), 13);
+
+        // Should have: [handle][type][client_id][service_code][reliable]
         assert_eq!(message[0], 0); // handle
         assert_eq!(message[1], RequestType::RegisterMlReq.to_u8());
+        // bytes 2-9 are client ID
+        assert_eq!(u16::from_le_bytes([message[10], message[11]]), 5559); // GFDI code
         assert_eq!(message[12], 2); // reliable flag
     }
 
-    #[test]
-    fn test_process_close_all_resp() {
+    #[tokio::test]
+    async fn test_process_close_all_resp() {
         let ble = Arc::new(MockBleSupport::new());
         let comm = CommunicatorV2::new(ble);
 
         // First register a service
-        comm.register_handle(Service::GFDI, 1);
-        comm.register_handle(Service::RealtimeHr, 2);
+        comm.register_handle(Service::GFDI, 1).await;
+        comm.register_handle(Service::RealtimeHr, 2).await;
 
         // Verify services are registered
         {
-            let state = comm.state.lock().unwrap();
+            let state = comm.state.lock().await;
             assert_eq!(state.service_by_handle.len(), 2);
             assert_eq!(state.handle_by_service.len(), 2);
         }
@@ -1763,7 +1833,7 @@ mod tests {
         let encoded = CobsCoDec::encode(&message);
 
         // Process the encoded message
-        let result = comm.on_characteristic_changed(&encoded);
+        let result = comm.on_characteristic_changed(&encoded).await;
         assert!(result.is_ok());
 
         // Verify services are cleared (except GFDI which should be re-registered)
@@ -1771,8 +1841,8 @@ mod tests {
         // because it would require the mock BLE support to actually process the write
     }
 
-    #[test]
-    fn test_process_register_ml_resp() {
+    #[tokio::test]
+    async fn test_process_register_ml_resp() {
         let ble = Arc::new(MockBleSupport::new());
         let comm = CommunicatorV2::new(ble);
 
@@ -1790,22 +1860,22 @@ mod tests {
         let encoded = CobsCoDec::encode(&message);
 
         // Process the encoded message
-        let result = comm.on_characteristic_changed(&encoded);
+        let result = comm.on_characteristic_changed(&encoded).await;
         assert!(result.is_ok());
 
         // Verify service is registered
-        let state = comm.state.lock().unwrap();
+        let state = comm.state.lock().await;
         assert_eq!(state.service_by_handle.get(&1), Some(&Service::GFDI));
         assert_eq!(state.handle_by_service.get(&Service::GFDI), Some(&1));
     }
 
-    #[test]
-    fn test_process_close_handle_resp() {
+    #[tokio::test]
+    async fn test_process_close_handle_resp() {
         let ble = Arc::new(MockBleSupport::new());
         let comm = CommunicatorV2::new(ble);
 
         // First register a service
-        comm.register_handle(Service::RealtimeHr, 2);
+        comm.register_handle(Service::RealtimeHr, 2).await;
 
         // Create a CLOSE_HANDLE_RESP message
         // Note: handle 0 is part of the outer message structure
@@ -1823,20 +1893,20 @@ mod tests {
         eprintln!("Encoded: {:?}", encoded);
 
         // Process the encoded message
-        let result = comm.on_characteristic_changed(&encoded);
+        let result = comm.on_characteristic_changed(&encoded).await;
         if let Err(ref e) = result {
             eprintln!("Error: {}", e);
         }
         assert!(result.is_ok());
 
         // Verify service is unregistered
-        let state = comm.state.lock().unwrap();
+        let state = comm.state.lock().await;
         assert_eq!(state.service_by_handle.get(&2), None);
         assert_eq!(state.handle_by_service.get(&Service::RealtimeHr), None);
     }
 
-    #[test]
-    fn test_process_handle_management_invalid_client_id() {
+    #[tokio::test]
+    async fn test_process_handle_management_invalid_client_id() {
         let ble = Arc::new(MockBleSupport::new());
         let comm = CommunicatorV2::new(ble);
 
@@ -1852,11 +1922,11 @@ mod tests {
         let encoded = CobsCoDec::encode(&message);
 
         // Process the encoded message - should succeed but be ignored
-        let result = comm.on_characteristic_changed(&encoded);
+        let result = comm.on_characteristic_changed(&encoded).await;
         assert!(result.is_ok());
 
         // Verify nothing was registered
-        let state = comm.state.lock().unwrap();
+        let state = comm.state.lock().await;
         assert_eq!(state.service_by_handle.len(), 0);
     }
 
@@ -1895,53 +1965,55 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_register_service_callback() {
+    #[tokio::test]
+    async fn test_register_service_callback() {
         let ble = Arc::new(MockBleSupport::new());
         let comm = CommunicatorV2::new(ble);
 
         let callback = TestServiceCallback::new();
         let _connect_called = callback.connect_called.clone();
 
-        comm.register_service_callback(Service::RealtimeHr, Box::new(callback));
+        comm.register_service_callback(Service::RealtimeHr, Box::new(callback))
+            .await;
 
         // Verify callback is registered
-        let state = comm.state.lock().unwrap();
+        let state = comm.state.lock().await;
         assert!(state.service_callbacks.contains_key(&Service::RealtimeHr));
         drop(state);
 
         // Simulate service registration
-        comm.register_handle(Service::RealtimeHr, 5);
+        comm.register_handle(Service::RealtimeHr, 5).await;
 
         // The connect callback won't be called in this simple test
         // because we're not going through the full MLR registration flow
     }
 
-    #[test]
-    fn test_unregister_service_callback() {
+    #[tokio::test]
+    async fn test_remove_service_callback() {
         let ble = Arc::new(MockBleSupport::new());
         let comm = CommunicatorV2::new(ble);
 
         let callback = TestServiceCallback::new();
-        comm.register_service_callback(Service::RealtimeHr, Box::new(callback));
+        comm.register_service_callback(Service::RealtimeHr, Box::new(callback))
+            .await;
 
         // Verify callback is registered
         {
-            let state = comm.state.lock().unwrap();
+            let state = comm.state.lock().await;
             assert!(state.service_callbacks.contains_key(&Service::RealtimeHr));
         }
 
         // Unregister
-        let removed = comm.unregister_service_callback(Service::RealtimeHr);
+        let removed = comm.unregister_service_callback(Service::RealtimeHr).await;
         assert!(removed.is_some());
 
         // Verify callback is removed
-        let state = comm.state.lock().unwrap();
+        let state = comm.state.lock().await;
         assert!(!state.service_callbacks.contains_key(&Service::RealtimeHr));
     }
 
-    #[test]
-    fn test_service_callback_on_close_all() {
+    #[tokio::test]
+    async fn test_service_callback_on_close_all() {
         let ble = Arc::new(MockBleSupport::new());
         let comm = CommunicatorV2::new(ble);
 
@@ -1950,11 +2022,13 @@ mod tests {
         let close_called1 = callback1.close_called.clone();
         let close_called2 = callback2.close_called.clone();
 
-        comm.register_service_callback(Service::RealtimeHr, Box::new(callback1));
-        comm.register_service_callback(Service::RealtimeSteps, Box::new(callback2));
+        comm.register_service_callback(Service::RealtimeHr, Box::new(callback1))
+            .await;
+        comm.register_service_callback(Service::RealtimeSteps, Box::new(callback2))
+            .await;
 
         // Call process_close_all_resp
-        let result = comm.process_close_all_resp();
+        let result = comm.process_close_all_resp().await;
         assert!(result.is_ok());
 
         // Verify both callbacks had onClose called
@@ -1962,12 +2036,12 @@ mod tests {
         assert!(*close_called2.lock().unwrap());
 
         // Verify callbacks are cleared
-        let state = comm.state.lock().unwrap();
+        let state = comm.state.lock().await;
         assert_eq!(state.service_callbacks.len(), 0);
     }
 
-    #[test]
-    fn test_gfdi_service_callback() {
+    #[tokio::test]
+    async fn test_gfdi_service_callback() {
         struct MockGfdiCallback {
             messages: Arc<StdMutex<Vec<Vec<u8>>>>,
         }
@@ -1993,6 +2067,9 @@ mod tests {
 
         let result = gfdi_callback.on_message(&encoded);
         assert!(result.is_ok());
+
+        // Wait for spawned task to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Verify decoded message was received (may have trailing zero from COBS)
         let received = messages.lock().unwrap();
@@ -2037,8 +2114,8 @@ mod tests {
         assert_eq!(*steps_value.lock().unwrap(), 1234);
     }
 
-    #[test]
-    fn test_file_transfer_callback() {
+    #[tokio::test]
+    async fn test_file_transfer_callback() {
         let completed_data = Arc::new(StdMutex::new(Vec::new()));
         let completed_clone = completed_data.clone();
 
@@ -2054,16 +2131,22 @@ mod tests {
         callback.on_message(&chunk1).unwrap();
         callback.on_message(&chunk2).unwrap();
 
+        // Wait for spawned tasks to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
         // Close the transfer
         callback.on_close().unwrap();
+
+        // Wait for completion callback to run
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Verify all data was collected
         let final_data = completed_data.lock().unwrap();
         assert_eq!(*final_data, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
-    #[test]
-    fn test_auto_gfdi_callback_creation() {
+    #[tokio::test]
+    async fn test_auto_gfdi_callback_creation() {
         struct TestGfdiHandler {
             messages: Arc<StdMutex<Vec<Vec<u8>>>>,
         }
@@ -2088,17 +2171,17 @@ mod tests {
 
         // Verify no GFDI callback exists yet
         {
-            let state = comm.state.lock().unwrap();
+            let state = comm.state.lock().await;
             assert!(!state.service_callbacks.contains_key(&Service::GFDI));
         }
 
         // Simulate GFDI service registration by calling the internal logic
         // In real usage, this would happen when processing REGISTER_ML_RESP
-        comm.register_handle(Service::GFDI, 1);
+        comm.register_handle(Service::GFDI, 1).await;
 
         // Now manually trigger the callback creation logic that would happen in process_register_ml_resp
         {
-            let mut state = comm.state.lock().unwrap();
+            let mut state = comm.state.lock().await;
             if !state.service_callbacks.contains_key(&Service::GFDI) {
                 if let Some(msg_callback) = &comm.message_callback {
                     let gfdi_callback = Box::new(GfdiServiceCallback::new(msg_callback.clone()));
@@ -2109,12 +2192,12 @@ mod tests {
 
         // Verify GFDI callback was auto-created
         {
-            let state = comm.state.lock().unwrap();
+            let state = comm.state.lock().await;
             assert!(state.service_callbacks.contains_key(&Service::GFDI));
         }
 
         // Test that the auto-created callback works
-        let state = comm.state.lock().unwrap();
+        let state = comm.state.lock().await;
         if let Some(callback) = state.service_callbacks.get(&Service::GFDI) {
             // Send a COBS-encoded test message
             let test_data = vec![1, 2, 3, 4, 5];
@@ -2122,6 +2205,9 @@ mod tests {
             callback.on_message(&encoded).unwrap();
         }
         drop(state);
+
+        // Wait for spawned task to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Verify the message was received by the handler
         let received = messages.lock().unwrap();

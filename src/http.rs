@@ -66,6 +66,7 @@ pub struct HttpRequest {
     pub compress_response_body: bool, // ConnectIQ field 7: COMPRESS_RESPONSE_BODY
     pub response_type: Option<u32>, // ConnectIQ field 8: RESPONSE_TYPE
     pub max_response_length: Option<u32>, // ConnectIQ field 5: MAX_RESPONSE_LENGTH
+    pub version: Option<u32>, // ConnectIQ field 9: VERSION (VERSION_1=0, VERSION_2=1)
 }
 
 impl HttpRequest {
@@ -172,6 +173,7 @@ impl HttpRequest {
         let mut compress_response_body = false;
         let mut response_type: Option<u32> = None;
         let mut max_response_length: Option<u32> = None;
+        let mut version: Option<u32> = None;
 
         let mut pos = 0;
 
@@ -228,53 +230,140 @@ impl HttpRequest {
                     }
                 }
                 3 => {
-                    // Field 3: Can be method (wire type 0) OR headers (wire type 2)
-                    if wire_type == 0 {
-                        // Wire type 0 (varint) = method enum
-                        let (method_val, len_bytes) = read_varint(&data[pos..])?;
-                        pos += len_bytes;
+                    // Field 3: For ConnectIQ (field 1) this is HTTP_HEADER_FIELDS (Monkey-C encoded)
+                    //          For RawResourceRequest (field 5) this is method or repeated headers
+                    if request_field == 1 {
+                        // ConnectIQ: HTTP_HEADER_FIELDS as Monkey-C encoded bytes
+                        if wire_type == 2 {
+                            let (len, len_bytes) = read_varint(&data[pos..])?;
+                            pos += len_bytes;
+                            let header_data = &data[pos..pos + len];
 
-                        if method_val <= 10 {
-                            method = HttpMethod::from_u8(method_val as u8).unwrap_or_else(|| {
-                                debug!(
-                                    "Unknown HTTP method value in field 3: {}, defaulting to GET",
-                                    method_val
-                                );
-                                HttpMethod::Get
-                            });
-                            debug!(
-                                "Parsed method from field 3: {:?} (value: {})",
-                                method, method_val
+                            debug!("Parsing ConnectIQ headers (Monkey-C format): {} bytes", len);
+                            println!(
+                                "   📋 Parsing ConnectIQ headers (Monkey-C format): {} bytes",
+                                len
                             );
+                            let header_hex: String = header_data
+                                .iter()
+                                .take(100)
+                                .map(|b| format!("{:02X}", b))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            println!("      Header data hex (first 100 bytes): {}", header_hex);
+
+                            // Strip Monkey-C magic header (AB CD AB CD) and 4-byte size, just like body processing
+                            let header_to_decode = if header_data.len() >= 8
+                                && header_data[0] == 0xAB
+                                && header_data[1] == 0xCD
+                                && header_data[2] == 0xAB
+                                && header_data[3] == 0xCD
+                            {
+                                &header_data[8..] // Skip magic (4 bytes) + size (4 bytes)
+                            } else {
+                                header_data
+                            };
+
+                            // Try to decode Monkey-C format headers
+                            match convert_garmin_body_to_json(header_to_decode) {
+                                Ok(json_bytes) => {
+                                    let json_str = String::from_utf8_lossy(&json_bytes);
+                                    debug!("Decoded headers JSON: {}", json_str);
+                                    println!("      ✅ Decoded headers JSON: {}", json_str);
+
+                                    // Parse the JSON to extract header key-value pairs
+                                    if let Ok(json_value) =
+                                        serde_json::from_str::<serde_json::Value>(&json_str)
+                                    {
+                                        if let Some(obj) = json_value.as_object() {
+                                            for (key, value) in obj {
+                                                // Convert value to string
+                                                let value_str = match value {
+                                                    serde_json::Value::String(s) => s.clone(),
+                                                    serde_json::Value::Number(n)
+                                                        if n.as_i64() == Some(1) =>
+                                                    {
+                                                        // Special case: integer 1 for Content-Type means application/json
+                                                        if key.to_lowercase() == "content-type" {
+                                                            "application/json".to_string()
+                                                        } else {
+                                                            n.to_string()
+                                                        }
+                                                    }
+                                                    _ => value.to_string(),
+                                                };
+                                                debug!("Header: {} = {}", key, value_str);
+                                                println!(
+                                                    "         Header: {} = {}",
+                                                    key, value_str
+                                                );
+                                                headers.insert(key.to_lowercase(), value_str);
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!("Failed to decode Monkey-C headers: {}", e);
+                                    println!("      ❌ Failed to decode Monkey-C headers: {}", e);
+                                }
+                            }
+                            pos += len;
                         } else {
                             debug!(
-                                "Field 3 value {} too large for method, skipping",
-                                method_val
+                                "Unexpected wire type {} for ConnectIQ field 3, skipping",
+                                wire_type
                             );
+                            skip_field(wire_type, &data[pos..], &mut pos)?;
                         }
-                    } else if wire_type == 2 {
-                        // Wire type 2 (length-delimited) = header
-                        let (len, len_bytes) = read_varint(&data[pos..])?;
-                        pos += len_bytes;
-                        let header_data = &data[pos..pos + len];
-
-                        match parse_header(header_data) {
-                            Ok((key, value)) => {
-                                debug!("Parsed header from field 3: {} = {}", key, value);
-                                headers.insert(key.to_lowercase(), value);
-                            }
-                            Err(e) => {
-                                debug!("Failed to parse header from field 3: {}", e);
-                            }
-                        }
-                        pos += len;
                     } else {
-                        // Other wire types in field 3 - skip
-                        debug!(
-                            "Field 3 with wire type {} (not method or header), skipping",
-                            wire_type
-                        );
-                        skip_field(wire_type, &data[pos..], &mut pos)?;
+                        // RawResourceRequest: method (wire type 0) or repeated headers (wire type 2)
+                        if wire_type == 0 {
+                            // Wire type 0 (varint) = method enum
+                            let (method_val, len_bytes) = read_varint(&data[pos..])?;
+                            pos += len_bytes;
+
+                            if method_val <= 10 {
+                                method = HttpMethod::from_u8(method_val as u8).unwrap_or_else(|| {
+                                    debug!(
+                                        "Unknown HTTP method value in field 3: {}, defaulting to GET",
+                                        method_val
+                                    );
+                                    HttpMethod::Get
+                                });
+                                debug!(
+                                    "Parsed method from field 3: {:?} (value: {})",
+                                    method, method_val
+                                );
+                            } else {
+                                debug!(
+                                    "Field 3 value {} too large for method, skipping",
+                                    method_val
+                                );
+                            }
+                        } else if wire_type == 2 {
+                            // Wire type 2 (length-delimited) = header
+                            let (len, len_bytes) = read_varint(&data[pos..])?;
+                            pos += len_bytes;
+                            let header_data = &data[pos..pos + len];
+
+                            match parse_header(header_data) {
+                                Ok((key, value)) => {
+                                    debug!("Parsed header from field 3: {} = {}", key, value);
+                                    headers.insert(key.to_lowercase(), value);
+                                }
+                                Err(e) => {
+                                    debug!("Failed to parse header from field 3: {}", e);
+                                }
+                            }
+                            pos += len;
+                        } else {
+                            // Other wire types in field 3 - skip
+                            debug!(
+                                "Field 3 with wire type {} (not method or header), skipping",
+                                wire_type
+                            );
+                            skip_field(wire_type, &data[pos..], &mut pos)?;
+                        }
                     }
                 }
                 4 => {
@@ -344,11 +433,11 @@ impl HttpRequest {
                         println!("      Input size: {} bytes", body.len());
                         let input_hex: String = body
                             .iter()
-                            .take(200)
+                            .take(600)
                             .map(|b| format!("{:02X}", b))
                             .collect::<Vec<_>>()
                             .join(" ");
-                        println!("      Input hex (first 200 bytes): {}", input_hex);
+                        println!("      Input hex (first 600 bytes): {}", input_hex);
 
                         // Try to convert Garmin format to JSON
                         match convert_garmin_body_to_json(&body) {
@@ -509,6 +598,23 @@ impl HttpRequest {
                         skip_field(wire_type, &data[pos..], &mut pos)?;
                     }
                 }
+                9 => {
+                    // Field 9: VERSION (int32) - ConnectIQ only
+                    if request_field == 1 {
+                        if wire_type == 0 {
+                            let (val, len_bytes) = read_varint(&data[pos..])?;
+                            pos += len_bytes;
+                            version = Some(val as u32);
+                            debug!("Parsed version: {}", val);
+                            println!("   📦 ConnectIQ version: {}", val);
+                        } else {
+                            debug!("Unexpected wire type {} for field 9, skipping", wire_type);
+                            skip_field(wire_type, &data[pos..], &mut pos)?;
+                        }
+                    } else {
+                        skip_field(wire_type, &data[pos..], &mut pos)?;
+                    }
+                }
                 _ => {
                     // Skip unknown fields
                     skip_field(wire_type, &data[pos..], &mut pos)?;
@@ -561,6 +667,7 @@ impl HttpRequest {
             compress_response_body,
             response_type,
             max_response_length,
+            version,
         };
 
         // Warn if DataTransfer is requested but not yet implemented
@@ -1038,8 +1145,12 @@ impl HttpResponse {
         }
 
         // Field 6: responseType (int32) - wire type 0
-        // Optional: type of response
-        // Not currently used
+        // Echo back the response type from the request if present
+        if let Some(resp_type) = request.response_type {
+            connectiq_response.push((6 << 3) | 0); // Field 6, varint
+            connectiq_response.extend_from_slice(&encode_varint(resp_type as usize));
+            println!("      Field 6 (responseType): {}", resp_type);
+        }
 
         println!("   📋 ConnectIQHTTPResponse structure:");
         println!("      Field 1 (status): {}", status_enum);
@@ -1054,20 +1165,50 @@ impl HttpResponse {
             }
         );
 
+        // Debug: print ConnectIQHTTPResponse hex
+        let connectiq_hex: String = connectiq_response
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("      Raw ConnectIQHTTPResponse hex: {}", connectiq_hex);
+        println!(
+            "      ConnectIQHTTPResponse size: {} bytes",
+            connectiq_response.len()
+        );
+
         // Build HttpService with field 2 (ConnectIQHTTPResponse)
         let mut http_service = Vec::new();
         http_service.push((2 << 3) | 2); // Field 2, length-delimited
-        http_service.extend_from_slice(&encode_varint(connectiq_response.len()));
+        let http_service_len_varint = encode_varint(connectiq_response.len());
+        http_service.extend_from_slice(&http_service_len_varint);
         http_service.extend_from_slice(&connectiq_response);
 
         // Build Smart protobuf wrapper
         let mut smart_proto = Vec::new();
         smart_proto.push((2 << 3) | 2); // Field 2, length-delimited
-        smart_proto.extend_from_slice(&encode_varint(http_service.len()));
+        let smart_proto_len_varint = encode_varint(http_service.len());
+        smart_proto.extend_from_slice(&smart_proto_len_varint);
         smart_proto.extend_from_slice(&http_service);
 
-        println!("   📋 HttpService size: {} bytes", http_service.len());
-        println!("   📋 Smart proto size: {} bytes", smart_proto.len());
+        println!("   📋 HttpService:");
+        println!("      Tag: 0x{:02X}", (2 << 3) | 2);
+        println!(
+            "      Length varint: {} bytes = {}",
+            http_service_len_varint.len(),
+            connectiq_response.len()
+        );
+        println!("      Payload: {} bytes", connectiq_response.len());
+        println!("      Total: {} bytes", http_service.len());
+        println!("   📋 Smart proto:");
+        println!("      Tag: 0x{:02X}", (2 << 3) | 2);
+        println!(
+            "      Length varint: {} bytes = {}",
+            smart_proto_len_varint.len(),
+            http_service.len()
+        );
+        println!("      Payload: {} bytes", http_service.len());
+        println!("      Total: {} bytes", smart_proto.len());
 
         // Build ProtobufResponse message (ID 5044)
         let mut message = Vec::new();
@@ -1093,17 +1234,41 @@ impl HttpResponse {
         // Protobuf payload
         message.extend_from_slice(&smart_proto);
 
-        // Update packet size (total - 2 bytes for size field itself)
-        let packet_size = (message.len() - 2) as u16;
+        // Calculate packet size: total message size INCLUDING size field and checksum
+        // Packet size = size_field (2) + message_id (2) + request_id (2) + data_offset (4) + total_proto_len (4) + proto_data_len (4) + proto_payload (N)
+        // This is just message.len() before adding the checksum
+        let packet_size = message.len() as u16 + 2;
         message[0..2].copy_from_slice(&packet_size.to_le_bytes());
 
-        // Add checksum (CRC-16)
+        debug!("   📋 ProtobufResponse structure:");
+        debug!("      Size field: {} (0x{:04X})", packet_size, packet_size);
+        debug!("      Message ID: 0x{:04X}", 5044);
+        debug!("      Request ID: {}", request_id);
+        debug!("      Data offset: 0");
+        debug!("      Total protobuf length: {} bytes", smart_proto.len());
+        debug!("      Protobuf data length: {} bytes", smart_proto.len());
+        debug!("      Protobuf payload: {} bytes", smart_proto.len());
+        debug!("      Message before checksum: {} bytes", message.len());
+        debug!(
+            "      Expected total with checksum: {} bytes",
+            message.len() + 2
+        );
+
+        // Add checksum (CRC-16) - computed over size field + all data
         let checksum = compute_checksum(&message);
         message.extend_from_slice(&checksum.to_le_bytes());
 
         println!("   📋 Final ConnectIQ ProtobufResponse:");
         println!("      Total message size: {} bytes", message.len());
-        println!("      Request ID: {}", request_id);
+        println!(
+            "      Breakdown: size(2) + header(16) + payload({}) + checksum(2)",
+            smart_proto.len()
+        );
+        println!(
+            "      Calculated: 2 + 16 + {} + 2 = {}",
+            smart_proto.len(),
+            2 + 16 + smart_proto.len() + 2
+        );
         println!("      Checksum: 0x{:04X}", checksum);
 
         Ok(message)
@@ -1773,14 +1938,66 @@ fn convert_garmin_body_to_json(data: &[u8]) -> Result<Vec<u8>> {
     // Parse the data structure
     let value = parse_monkeyc_value(data, &mut pos, &string_dict, header_start)?;
 
-    // Convert to JSON
-    let json = serde_json::to_string(&value)
-        .map_err(|e| GarminError::InvalidMessage(format!("Failed to serialize JSON: {}", e)))?;
+    // Convert to JSON with duplicate key handling
+    let json = garmin_value_to_json(&value)?;
 
     debug!("Converted to JSON: {}", json);
     println!("      ✅ Conversion successful: {} bytes", json.len());
     println!("      Output JSON: {}", json);
     Ok(json.into_bytes())
+}
+
+/// Convert GarminValue to JSON string, handling duplicate keys
+fn garmin_value_to_json(value: &GarminValue) -> Result<String> {
+    fn value_to_json_value(
+        val: &GarminValue,
+        key_counters: &mut std::collections::HashMap<String, usize>,
+    ) -> serde_json::Value {
+        match val {
+            GarminValue::Null => serde_json::Value::Null,
+            GarminValue::Integer(i) => serde_json::Value::Number((*i).into()),
+            GarminValue::Float(f) => serde_json::Number::from_f64(*f as f64)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            GarminValue::String(s) => serde_json::Value::String(s.clone()),
+            GarminValue::Boolean(b) => serde_json::Value::Bool(*b),
+            GarminValue::Long(l) => serde_json::Value::Number((*l).into()),
+            GarminValue::Double(d) => serde_json::Number::from_f64(*d)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            GarminValue::Object(fields) => {
+                let mut map = serde_json::Map::new();
+                let mut local_counters = std::collections::HashMap::new();
+
+                for (key, value) in fields {
+                    // Check if this key already exists (duplicate)
+                    let final_key = if map.contains_key(key) {
+                        // Duplicate key - number them
+                        let count = local_counters.entry(key.clone()).or_insert(0);
+                        *count += 1;
+                        format!("{}_{}", key, count)
+                    } else {
+                        key.clone()
+                    };
+
+                    map.insert(final_key, value_to_json_value(value, key_counters));
+                }
+                serde_json::Value::Object(map)
+            }
+            GarminValue::Array(items) => {
+                let arr: Vec<_> = items
+                    .iter()
+                    .map(|v| value_to_json_value(v, key_counters))
+                    .collect();
+                serde_json::Value::Array(arr)
+            }
+        }
+    }
+
+    let mut counters = std::collections::HashMap::new();
+    let json_value = value_to_json_value(value, &mut counters);
+    serde_json::to_string(&json_value)
+        .map_err(|e| GarminError::InvalidMessage(format!("Failed to serialize JSON: {}", e)))
 }
 
 #[derive(Debug)]
@@ -1976,6 +2193,14 @@ fn parse_monkeyc_value(
 
             let mut fields = Vec::new();
             for i in 0..count {
+                let field_start_pos = *pos;
+                println!(
+                    "         📍 Parsing field {}/{} at pos {}",
+                    i + 1,
+                    count,
+                    field_start_pos
+                );
+
                 // Parse key (should be a string reference, type 0x03)
                 let key_value = parse_monkeyc_value(data, pos, string_dict, header_start)?;
                 let key = match key_value {
@@ -1983,8 +2208,30 @@ fn parse_monkeyc_value(
                     _ => format!("field_{}", i),
                 };
 
+                let value_start_pos = *pos;
+                println!(
+                    "            Key: \"{}\" (pos after key: {})",
+                    key, value_start_pos
+                );
+
                 // Parse value
                 let value = parse_monkeyc_value(data, pos, string_dict, header_start)?;
+
+                println!(
+                    "            Value type: {:?} (pos after value: {})",
+                    match &value {
+                        GarminValue::Null => "Null",
+                        GarminValue::Integer(_) => "Integer",
+                        GarminValue::Float(_) => "Float",
+                        GarminValue::String(_) => "String",
+                        GarminValue::Boolean(_) => "Boolean",
+                        GarminValue::Long(_) => "Long",
+                        GarminValue::Double(_) => "Double",
+                        GarminValue::Object(_) => "Object",
+                        GarminValue::Array(_) => "Array",
+                    },
+                    *pos
+                );
 
                 debug!("Object field: {} = {:?}", key, value);
                 fields.push((key, value));
@@ -2048,45 +2295,150 @@ fn parse_monkeyc_value(
 /// Convert JSON response body back to Garmin's binary format
 /// The watch expects responses in Garmin's binary key-value format
 /// Transform ConnectIQ JSON structure:
-/// From: {"data": {"type": "..."}, "otherField": {...}}
-/// To: {"type": "...", "data": {"otherField": {...}}}
+/// From: {"data": {"type": "...", "3t": {"0t": {...}}, "template": "...", ...}, "template": "..."}
+/// To: {"type": "...", "data": {"3": {"template": "..."}, "0": {"template": "..."}, ...}}
 fn transform_connectiq_json(json_data: &[u8]) -> Result<Vec<u8>> {
     use std::str;
 
     let json_str = str::from_utf8(json_data)
         .map_err(|e| GarminError::InvalidMessage(format!("Invalid UTF-8 in JSON: {}", e)))?;
 
-    let mut json_value: serde_json::Value = serde_json::from_str(json_str)
+    let json_value: serde_json::Value = serde_json::from_str(json_str)
         .map_err(|e| GarminError::InvalidMessage(format!("Failed to parse JSON: {}", e)))?;
 
     // Check if this is a ConnectIQ structure with a "data" object containing "type"
-    if let Some(obj) = json_value.as_object_mut() {
+    if let Some(obj) = json_value.as_object() {
         if let Some(data_obj) = obj.get("data").and_then(|v| v.as_object()) {
             if let Some(type_value) = data_obj.get("type") {
                 // Extract type from data
                 let type_clone = type_value.clone();
 
-                // Build new data object with all top-level fields except "data"
+                // Build new data object by flattening nested structures and handling duplicates
                 let mut new_data = serde_json::Map::new();
+
+                // Helper function to extract key sequence from nested structure
+                // The nested chain like "3t" -> "0t" -> "2t" -> "4t" -> "1t" defines the KEY ORDER
+                fn extract_key_sequence(value: &serde_json::Value) -> Vec<String> {
+                    let mut keys = Vec::new();
+                    let mut current = value;
+
+                    while let Some(inner_obj) = current.as_object() {
+                        if inner_obj.len() == 1 {
+                            let (key, val) = inner_obj.iter().next().unwrap();
+                            if key.ends_with('t') && key != "template" {
+                                keys.push(key.clone());
+                                current = val;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    keys
+                }
+
+                // First, find the nested structure to extract key sequence
+                let mut key_sequence = Vec::new();
+                let mut nested_template = None;
+
+                for (key, value) in data_obj.iter() {
+                    if key.ends_with('t') && !key.starts_with("template") {
+                        // Extract key sequence from nested structure
+                        key_sequence.push(key.clone());
+                        key_sequence.extend(extract_key_sequence(value));
+
+                        // Extract the innermost template value
+                        let mut current = value;
+                        while let Some(inner_obj) = current.as_object() {
+                            if inner_obj.len() == 1 {
+                                let (k, v) = inner_obj.iter().next().unwrap();
+                                if k.ends_with('t') && k != "template" {
+                                    current = v;
+                                } else if k == "template" {
+                                    nested_template = Some(v.clone());
+                                    break;
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                }
+
+                // Collect all template values in order (nested one first, then the duplicate keys)
+                let mut templates = Vec::new();
+                if let Some(tmpl) = nested_template {
+                    templates.push(tmpl);
+                }
+
+                // Add templates from data_obj (skipping type and nested structure)
+                for (key, value) in data_obj.iter() {
+                    if key == "template" || key.starts_with("template_") {
+                        templates.push(value.clone());
+                    }
+                }
+
+                // Add templates from top level
                 for (key, value) in obj.iter() {
-                    if key != "data" {
+                    if key == "template" || key.starts_with("template_") {
+                        templates.push(value.clone());
+                    }
+                }
+
+                // Assign templates to keys in sequence order
+                for (i, template_value) in templates.iter().enumerate() {
+                    if i < key_sequence.len() {
+                        let mut template_obj = serde_json::Map::new();
+                        template_obj.insert("template".to_string(), template_value.clone());
+                        new_data.insert(
+                            key_sequence[i].clone(),
+                            serde_json::Value::Object(template_obj),
+                        );
+                    }
+                }
+
+                // Also copy over any other fields that aren't part of the nested structure
+                for (key, value) in data_obj.iter() {
+                    if key != "type"
+                        && !key.ends_with('t')
+                        && key != "template"
+                        && !key.starts_with("template_")
+                    {
                         new_data.insert(key.clone(), value.clone());
                     }
                 }
 
-                // Clear the object and rebuild with new structure
-                obj.clear();
-                obj.insert("type".to_string(), type_clone);
-                obj.insert("data".to_string(), serde_json::Value::Object(new_data));
+                // Also copy over top-level fields (like glanceTemplate) that are siblings to data
+                for (key, value) in obj.iter() {
+                    if key != "data" && key != "template" && !key.starts_with("template_") {
+                        new_data.insert(key.clone(), value.clone());
+                    }
+                }
+
+                // Build final structure
+                let mut result = serde_json::Map::new();
+                result.insert("type".to_string(), type_clone);
+                result.insert("data".to_string(), serde_json::Value::Object(new_data));
+
+                let transformed_json = serde_json::to_string(&serde_json::Value::Object(result))
+                    .map_err(|e| {
+                        GarminError::InvalidMessage(format!(
+                            "Failed to serialize transformed JSON: {}",
+                            e
+                        ))
+                    })?;
+
+                return Ok(transformed_json.into_bytes());
             }
         }
     }
 
-    let transformed_json = serde_json::to_string(&json_value).map_err(|e| {
-        GarminError::InvalidMessage(format!("Failed to serialize transformed JSON: {}", e))
-    })?;
-
-    Ok(transformed_json.into_bytes())
+    // If no transformation needed, return original
+    Ok(json_data.to_vec())
 }
 
 fn convert_json_to_garmin_body(json_data: &[u8]) -> Result<Vec<u8>> {

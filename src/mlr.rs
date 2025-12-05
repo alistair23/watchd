@@ -9,9 +9,11 @@
 use crate::types::{GarminError, Result};
 use log::{debug, error, info, warn};
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
+
+/// Helper to safely block on async operations, returns None if no runtime available
 
 // MLR Protocol Constants
 const MLR_FLAG_MASK: u8 = 0x80;
@@ -36,13 +38,15 @@ struct Fragment {
 }
 
 /// Message sender trait for sending packets to the device
+#[async_trait::async_trait]
 pub trait MessageSender: Send + Sync {
-    fn send_packet(&self, task_name: &str, packet: &[u8]) -> Result<()>;
+    async fn send_packet(&self, task_name: &str, packet: &[u8]) -> Result<()>;
 }
 
 /// Message receiver trait for handling received data
+#[async_trait::async_trait]
 pub trait MessageReceiver: Send + Sync {
-    fn on_data_received(&self, data: &[u8]) -> Result<()>;
+    async fn on_data_received(&self, data: &[u8]) -> Result<()>;
 }
 
 /// MLR Communicator state
@@ -109,8 +113,8 @@ impl MlrCommunicator {
     }
 
     /// Set the maximum packet size
-    pub fn set_max_packet_size(&self, max_packet_size: usize) {
-        let mut state = self.state.lock().unwrap();
+    pub async fn set_max_packet_size(&self, max_packet_size: usize) {
+        let mut state = self.state.lock().await;
         state.max_packet_size = max_packet_size;
         debug!("MLR max packet size set to {}", max_packet_size);
     }
@@ -132,11 +136,11 @@ impl MlrCommunicator {
                     break;
                 }
 
-                if let Err(e) = Self::check_ack_timeout(&state, &sender) {
+                if let Err(e) = Self::check_ack_timeout(&state, &sender).await {
                     error!("ACK timeout check failed: {}", e);
                 }
 
-                if let Err(e) = Self::check_retransmit_timeout(&state, &sender) {
+                if let Err(e) = Self::check_retransmit_timeout(&state, &sender).await {
                     error!("Retransmit timeout check failed: {}", e);
                     // If error contains "Not connected", clear MLR state to stop retries
                     let err_msg = format!("{}", e);
@@ -144,7 +148,7 @@ impl MlrCommunicator {
                         warn!(
                             "Detected disconnection - clearing MLR state to stop retransmissions"
                         );
-                        Self::clear_state(&state);
+                        Self::clear_state(&state).await;
                     }
                 }
             }
@@ -154,12 +158,12 @@ impl MlrCommunicator {
     }
 
     /// Queue a message for sending
-    pub fn send_message(&self, task_name: &str, message: &[u8]) -> Result<()> {
+    pub async fn send_message(&self, task_name: &str, message: &[u8]) -> Result<()> {
         if message.is_empty() {
             return Err(GarminError::EmptyMessage);
         }
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().await;
 
         // Don't queue new messages if paused
         if state.paused {
@@ -194,13 +198,13 @@ impl MlrCommunicator {
         }
 
         drop(state);
-        self.run_protocol()?;
+        self.run_protocol().await?;
 
         Ok(())
     }
 
     /// Handle a received packet
-    pub fn on_packet_received(&self, packet: &[u8]) -> Result<()> {
+    pub async fn on_packet_received(&self, packet: &[u8]) -> Result<()> {
         if packet.len() < 2 {
             return Err(GarminError::PacketTooShort(packet.len()));
         }
@@ -217,7 +221,7 @@ impl MlrCommunicator {
         let req_num = ((byte0 & REQ_NUM_MASK) << 2) | ((byte1 >> 6) & 0x03);
         let seq_num = byte1 & SEQ_NUM_MASK;
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().await;
 
         if packet_handle != (state.handle & 0x07) {
             return Err(GarminError::InvalidHandle {
@@ -248,7 +252,7 @@ impl MlrCommunicator {
                 Self::schedule_ack(&mut state);
                 drop(state);
 
-                if let Err(e) = self.receiver.on_data_received(&data) {
+                if let Err(e) = self.receiver.on_data_received(&data).await {
                     error!("Receiver failed to handle MLR data: {}", e);
                 }
             } else {
@@ -258,7 +262,7 @@ impl MlrCommunicator {
                 );
                 // Correct sequence will be retransmitted by sender
                 // Regardless, re-send the expected ack since the sender shouldn't be sending these
-                Self::send_ack_packet(&state, &self.sender)?;
+                Self::send_ack_packet(&state, &self.sender).await?;
                 drop(state);
             }
         } else {
@@ -268,10 +272,10 @@ impl MlrCommunicator {
         info!("Running Protocol");
         // Run protocol multiple times to drain queue if window opened up
         for _ in 0..10 {
-            match self.run_protocol() {
+            match self.run_protocol().await {
                 Ok(_) => {
                     // Check if there are more fragments to send
-                    let state = self.state.lock().unwrap();
+                    let state = self.state.lock().await;
                     if state.fragment_queue.is_empty() {
                         break;
                     }
@@ -349,16 +353,18 @@ impl MlrCommunicator {
     }
 
     /// Send an ACK-only packet
-    fn send_ack_packet(state: &MlrState, sender: &Arc<dyn MessageSender>) -> Result<()> {
+    async fn send_ack_packet(state: &MlrState, sender: &Arc<dyn MessageSender>) -> Result<()> {
         let packet = Self::create_packet(state, state.next_rcv_seq, 0, &[]);
-        sender.send_packet(&format!("ack reqNum={}", state.next_rcv_seq), &packet)?;
+        sender
+            .send_packet(&format!("ack reqNum={}", state.next_rcv_seq), &packet)
+            .await?;
         debug!("Sent ACK packet: reqNum={}", state.next_rcv_seq);
         Ok(())
     }
 
     /// Run the protocol - send pending fragments if possible
-    fn run_protocol(&self) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+    async fn run_protocol(&self) -> Result<()> {
+        let mut state = self.state.lock().await;
 
         // Don't send anything if paused
         if state.paused {
@@ -401,7 +407,7 @@ impl MlrCommunicator {
             }
 
             drop(state);
-            self.sender.send_packet(&task_name, &packet)?;
+            self.sender.send_packet(&task_name, &packet).await?;
 
             debug!(
                 "Sent MLR packet: seqNum={}, dataLen={}",
@@ -434,51 +440,62 @@ impl MlrCommunicator {
     }
 
     /// Check if ACK timeout has expired and send ACK if needed
-    fn check_ack_timeout(
+    /// Check if we need to send a delayed ACK
+    async fn check_ack_timeout(
         state: &Arc<Mutex<MlrState>>,
         sender: &Arc<dyn MessageSender>,
     ) -> Result<()> {
-        let mut state_guard = state.lock().unwrap();
+        let (should_send_ack, next_rcv_seq, packet) = {
+            let mut state_guard = state.lock().await;
 
-        // Don't send ACKs if paused
-        if state_guard.paused {
-            return Ok(());
-        }
-
-        if let Some(last_ack_time) = state_guard.last_ack_time {
-            if last_ack_time.elapsed() >= Duration::from_millis(ACK_TIMEOUT_MS) {
-                let next_rcv_seq = state_guard.next_rcv_seq;
-                let packet = Self::create_packet(&state_guard, next_rcv_seq, 0, &[]);
-                state_guard.last_send_ack = next_rcv_seq;
-                state_guard.last_ack_time = None;
-
-                drop(state_guard);
-                sender.send_packet(&format!("ack reqNum={}", next_rcv_seq), &packet)?;
-                debug!("Sent ACK packet after timeout: reqNum={}", next_rcv_seq);
+            // Don't send ACKs if paused
+            if state_guard.paused {
+                return Ok(());
             }
+
+            if let Some(last_ack_time) = state_guard.last_ack_time {
+                if last_ack_time.elapsed() >= Duration::from_millis(ACK_TIMEOUT_MS) {
+                    let next_rcv_seq = state_guard.next_rcv_seq;
+                    let packet = Self::create_packet(&state_guard, next_rcv_seq, 0, &[]);
+                    state_guard.last_send_ack = next_rcv_seq;
+                    state_guard.last_ack_time = None;
+
+                    (true, next_rcv_seq, packet)
+                } else {
+                    return Ok(());
+                }
+            } else {
+                return Ok(());
+            }
+        }; // MutexGuard is dropped here
+
+        if should_send_ack {
+            sender
+                .send_packet(&format!("ack reqNum={}", next_rcv_seq), &packet)
+                .await?;
+            debug!("Sent ACK packet after timeout: reqNum={}", next_rcv_seq);
         }
 
         Ok(())
     }
 
     /// Pause MLR operations (prevents sending and retransmissions)
-    pub fn pause(&self) {
-        let mut state_guard = self.state.lock().unwrap();
+    pub async fn pause(&self) {
+        let mut state_guard = self.state.lock().await;
         debug!("Pausing MLR communicator");
         state_guard.paused = true;
     }
 
     /// Resume MLR operations
-    pub fn resume(&self) {
-        let mut state_guard = self.state.lock().unwrap();
+    pub async fn resume(&self) {
+        let mut state_guard = self.state.lock().await;
         debug!("Resuming MLR communicator");
         state_guard.paused = false;
     }
 
     /// Clear MLR state and pause (used when connection is lost)
-    pub fn clear_and_pause(&self) {
-        let mut state_guard = self.state.lock().unwrap();
-
+    pub async fn clear_and_pause(&self) {
+        let mut state_guard = self.state.lock().await;
         debug!("Clearing and pausing MLR state due to disconnection");
 
         // Pause operations
@@ -508,21 +525,15 @@ impl MlrCommunicator {
     }
 
     /// Clear MLR state (used when connection is lost)
-    fn clear_state(state: &Arc<Mutex<MlrState>>) {
-        let mut state_guard = state.lock().unwrap();
-
+    async fn clear_state(state: &Arc<Mutex<MlrState>>) {
+        let mut state_guard = state.lock().await;
         debug!("Clearing MLR state due to disconnection");
 
         // Clear sent fragments
         for i in 0..state_guard.sent_fragments.len() {
             state_guard.sent_fragments[i] = None;
         }
-
-        // Clear fragment queue
         state_guard.fragment_queue.clear();
-
-        // Reset sequence numbers but don't reset next_send_seq (keep it for after reconnect)
-        state_guard.last_rcv_ack = state_guard.next_send_seq;
 
         // Clear timers
         state_guard.last_ack_time = None;
@@ -537,97 +548,104 @@ impl MlrCommunicator {
     }
 
     /// Check if retransmission timeout has expired and retransmit if needed
-    fn check_retransmit_timeout(
+    /// Check if we need to retransmit unacked packets
+    async fn check_retransmit_timeout(
         state: &Arc<Mutex<MlrState>>,
         sender: &Arc<dyn MessageSender>,
     ) -> Result<()> {
-        let mut state_guard = state.lock().unwrap();
+        // Collect all packets to send while holding the lock
+        let packets_to_send: Vec<(String, Vec<u8>, u8)> = {
+            let mut state_guard = state.lock().await;
 
-        // Don't retransmit if paused
-        if state_guard.paused {
-            return Ok(());
-        }
+            // Don't retransmit if paused
+            if state_guard.paused {
+                return Ok(());
+            }
 
-        if let Some(last_retransmit) = state_guard.last_retransmit_time {
-            if last_retransmit.elapsed() >= state_guard.retransmission_timeout {
-                debug!("Retransmission timeout expired");
+            if let Some(last_retransmit) = state_guard.last_retransmit_time {
+                if last_retransmit.elapsed() >= state_guard.retransmission_timeout {
+                    debug!("Retransmission timeout expired");
 
-                // Backoff retransmission timeout and reduce the maximum unacked
-                let new_timeout = (state_guard.retransmission_timeout.as_millis() as u64 * 2)
-                    .min(MAX_RETRANSMISSION_TIMEOUT_MS);
-                state_guard.retransmission_timeout = Duration::from_millis(new_timeout);
-                state_guard.max_num_unacked_send =
-                    state_guard.max_num_unacked_send.div_ceil(2).max(1);
+                    // Backoff retransmission timeout and reduce the maximum unacked
+                    let new_timeout = (state_guard.retransmission_timeout.as_millis() as u64 * 2)
+                        .min(MAX_RETRANSMISSION_TIMEOUT_MS);
+                    state_guard.retransmission_timeout = Duration::from_millis(new_timeout);
+                    state_guard.max_num_unacked_send =
+                        state_guard.max_num_unacked_send.div_ceil(2).max(1);
 
-                debug!(
-                    "Retransmission: timeout={}ms, maxUnacked={}, will re-send fragments [{}, {}]",
-                    new_timeout,
-                    state_guard.max_num_unacked_send,
-                    state_guard.last_rcv_ack,
-                    state_guard.next_send_seq.wrapping_sub(1)
-                );
-
-                // Re-send all unacked fragments
-                let mut i = state_guard.last_rcv_ack;
-                let mut sent_count = 0;
-                while i != state_guard.next_send_seq {
-                    if let Some(fragment) = &state_guard.sent_fragments[i as usize] {
-                        let packet = Self::create_packet(
-                            &state_guard,
-                            state_guard.next_rcv_seq,
-                            i,
-                            &fragment.data,
-                        );
-                        let task_name =
-                            format!("retransmission {} ({})", fragment.task_name, fragment.num);
-
-                        drop(state_guard);
-
-                        // Try to send, but if we get "Not connected" error, abort immediately
-                        match sender.send_packet(&task_name, &packet) {
-                            Ok(_) => {
-                                state_guard = state.lock().unwrap();
-                            }
-                            Err(e) => {
-                                let err_msg = format!("{}", e);
-                                if err_msg.contains("Not connected")
-                                    || err_msg.contains("not connected")
-                                {
-                                    // Connection lost - clear state and abort retransmission
-                                    warn!("Connection lost during retransmission - clearing MLR state");
-                                    state_guard = state.lock().unwrap();
-                                    // Clear sent fragments to stop retransmission loop
-                                    for i in 0..state_guard.sent_fragments.len() {
-                                        state_guard.sent_fragments[i] = None;
-                                    }
-                                    state_guard.fragment_queue.clear();
-                                    state_guard.last_retransmit_time = None;
-                                    return Err(e);
-                                }
-                                return Err(e);
-                            }
-                        }
-
-                        debug!("Re-sent fragment {}", i);
-                        sent_count += 1;
-                    } else {
-                        error!("Attempting to re-send null fragment at index {}", i);
-                    }
-
-                    i = (i + 1) % (MAX_SEQ_NUM + 1);
-                }
-
-                // Only restart the timer if we actually sent some fragments
-                if sent_count > 0 {
-                    state_guard.last_retransmit_time = Some(Instant::now());
-                } else {
-                    // All fragments were null, clear the timer to stop retrying
-                    state_guard.last_retransmit_time = None;
-                    warn!(
-                        "Retransmission timeout with no valid fragments to send - clearing timer"
+                    debug!(
+                        "Retransmission: timeout={}ms, maxUnacked={}, will re-send fragments [{}, {}]",
+                        new_timeout,
+                        state_guard.max_num_unacked_send,
+                        state_guard.last_rcv_ack,
+                        state_guard.next_send_seq.wrapping_sub(1)
                     );
+
+                    // Collect all packets to send
+                    let mut packets = Vec::new();
+                    let mut i = state_guard.last_rcv_ack;
+                    while i != state_guard.next_send_seq {
+                        if let Some(fragment) = &state_guard.sent_fragments[i as usize] {
+                            let packet = Self::create_packet(
+                                &state_guard,
+                                state_guard.next_rcv_seq,
+                                i,
+                                &fragment.data,
+                            );
+                            let task_name =
+                                format!("retransmission {} ({})", fragment.task_name, fragment.num);
+                            packets.push((task_name, packet, i));
+                        } else {
+                            error!("Attempting to re-send null fragment at index {}", i);
+                        }
+                        i = (i + 1) % (MAX_SEQ_NUM + 1);
+                    }
+                    packets
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        }; // MutexGuard is dropped here
+
+        // Send all packets without holding the lock
+        let had_packets = !packets_to_send.is_empty();
+        let mut sent_count = 0;
+        for (task_name, packet, i) in packets_to_send {
+            match sender.send_packet(&task_name, &packet).await {
+                Ok(_) => {
+                    debug!("Re-sent fragment {}", i);
+                    sent_count += 1;
+                }
+                Err(e) => {
+                    let err_msg = format!("{}", e);
+                    if err_msg.contains("Not connected") || err_msg.contains("not connected") {
+                        // Connection lost - clear state and abort retransmission
+                        warn!("Connection lost during retransmission - clearing MLR state");
+                        let mut state_guard = state.lock().await;
+                        // Clear sent fragments to stop retransmission loop
+                        for i in 0..state_guard.sent_fragments.len() {
+                            state_guard.sent_fragments[i] = None;
+                        }
+                        state_guard.fragment_queue.clear();
+                        state_guard.last_retransmit_time = None;
+                        return Err(e);
+                    }
+                    return Err(e);
                 }
             }
+        }
+
+        // Update the retransmission timer
+        if sent_count > 0 {
+            let mut state_guard = state.lock().await;
+            state_guard.last_retransmit_time = Some(Instant::now());
+        } else if had_packets {
+            // All fragments were null or failed, clear the timer to stop retrying
+            let mut state_guard = state.lock().await;
+            state_guard.last_retransmit_time = None;
+            warn!("Retransmission timeout with no valid fragments sent - clearing timer");
         }
 
         Ok(())
@@ -646,23 +664,17 @@ impl MlrCommunicator {
             let _ = tx.try_send(());
         }
 
-        let mut state = self.state.lock().unwrap();
-        state.fragment_queue.clear();
-    }
-
-    /// Handle connection state changes
-    pub fn on_connection_state_change(&self, connected: bool) {
-        if !connected {
-            let mut state = self.state.lock().unwrap();
-            state.last_ack_time = None;
-            state.last_retransmit_time = None;
-        }
+        // Note: We can't clear the fragment queue here in Drop context
+        // It will be cleaned up when the Arc is dropped
     }
 }
 
 impl Drop for MlrCommunicator {
     fn drop(&mut self) {
-        self.close();
+        // Just send shutdown signal, don't try to lock (might not be in tokio context)
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.try_send(());
+        }
     }
 }
 
@@ -692,8 +704,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl MessageSender for TestSender {
-        fn send_packet(&self, _task_name: &str, packet: &[u8]) -> Result<()> {
+        async fn send_packet(&self, _task_name: &str, packet: &[u8]) -> Result<()> {
             self.packets.lock().unwrap().push(packet.to_vec());
             Ok(())
         }
@@ -715,8 +728,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl MessageReceiver for TestReceiver {
-        fn on_data_received(&self, data: &[u8]) -> Result<()> {
+        async fn on_data_received(&self, data: &[u8]) -> Result<()> {
             self.messages.lock().unwrap().push(data.to_vec());
             Ok(())
         }
@@ -729,14 +743,14 @@ mod tests {
         let _mlr = MlrCommunicator::new(1, 100, sender, receiver);
     }
 
-    #[test]
-    fn test_mlr_send_small_message() {
+    #[tokio::test]
+    async fn test_mlr_send_small_message() {
         let sender = Arc::new(TestSender::new());
         let receiver = Arc::new(TestReceiver::new());
         let mlr = MlrCommunicator::new(1, 100, sender.clone(), receiver);
 
         let message = vec![0x01, 0x02, 0x03, 0x04];
-        mlr.send_message("test", &message).unwrap();
+        mlr.send_message("test", &message).await.unwrap();
 
         let packets = sender.get_packets();
         assert_eq!(packets.len(), 1);
@@ -747,14 +761,14 @@ mod tests {
         assert_eq!(packet.len() - 2, message.len()); // Data length
     }
 
-    #[test]
-    fn test_mlr_send_fragmented_message() {
+    #[tokio::test]
+    async fn test_mlr_send_fragmented_message() {
         let sender = Arc::new(TestSender::new());
         let receiver = Arc::new(TestReceiver::new());
         let mlr = MlrCommunicator::new(1, 10, sender.clone(), receiver);
 
         let message = vec![0x01; 30]; // 30 bytes with max_packet_size 10 should fragment
-        mlr.send_message("test", &message).unwrap();
+        mlr.send_message("test", &message).await.unwrap();
 
         // The message should be queued internally as fragments
         // We can't easily test the actual sending without async runtime
@@ -762,8 +776,8 @@ mod tests {
         // This tests that fragmentation logic doesn't panic
     }
 
-    #[test]
-    fn test_mlr_receive_packet() {
+    #[tokio::test]
+    async fn test_mlr_receive_packet() {
         let sender = Arc::new(TestSender::new());
         let receiver = Arc::new(TestReceiver::new());
         let mlr = MlrCommunicator::new(1, 100, sender, receiver.clone());
@@ -772,7 +786,7 @@ mod tests {
         let mut packet = vec![0x90, 0x00]; // MLR flag + handle 1
         packet.extend_from_slice(&[0x01, 0x02, 0x03]);
 
-        mlr.on_packet_received(&packet).unwrap();
+        mlr.on_packet_received(&packet).await.unwrap();
 
         let messages = receiver.get_messages();
         assert_eq!(messages.len(), 1);
