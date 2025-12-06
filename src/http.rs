@@ -813,11 +813,7 @@ impl HttpResponse {
 
         // Check if we should use DataTransfer (field 4) instead of body (field 3)
         // This matches GadgetBridge: useDataXfer && status == 200
-        // Also use DataTransfer for large responses (>2KB) to avoid LENGTH_ERROR
-        // Watch rejects inline responses larger than ~4KB with LENGTH_ERROR (status 5)
-        const DATA_TRANSFER_THRESHOLD: usize = 2048;
-        let should_use_data_transfer = self.status == 200
-            && (request.use_data_xfer || body_data.len() > DATA_TRANSFER_THRESHOLD);
+        let should_use_data_transfer = self.status == 200 && request.use_data_xfer;
 
         let transfer_id = if should_use_data_transfer && data_transfer.is_some() {
             let handler = data_transfer.unwrap();
@@ -825,12 +821,6 @@ impl HttpResponse {
             println!("   📦 Using DataTransfer for response body");
             println!("      Transfer ID: {}", id);
             println!("      Body size: {} bytes", body_data.len());
-            if body_data.len() > DATA_TRANSFER_THRESHOLD {
-                println!(
-                    "      Reason: Large response (>{} bytes threshold)",
-                    DATA_TRANSFER_THRESHOLD
-                );
-            }
             if request.use_data_xfer {
                 println!("      Reason: Request has useDataXfer=true");
             }

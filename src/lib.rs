@@ -11,6 +11,7 @@
 //! - `communicator`: High-level Garmin v2 communicator interface
 //! - `types`: Common types and enums used throughout the library
 
+pub mod calendar;
 pub mod cobs;
 pub mod communicator;
 pub mod data_transfer;
@@ -18,9 +19,11 @@ pub mod fit;
 pub mod http;
 pub mod messages;
 pub mod mlr;
+pub mod protobuf_calendar;
 pub mod types;
 pub mod watchdog;
 
+pub use calendar::{CalendarError, CalendarEvent, CalendarManager, CalendarProvider};
 pub use cobs::CobsCoDec;
 pub use communicator::{
     AsyncGfdiMessageCallback, BleSupport, CharacteristicHandle, CommunicatorV2,
@@ -40,6 +43,10 @@ pub use messages::{
     NotificationSubscriptionMessage, Status, SynchronizationMessage, WeatherRequestMessage,
 };
 pub use mlr::{MessageReceiver, MessageSender, MlrCommunicator};
+pub use protobuf_calendar::{
+    encode_calendar_response, handle_calendar_request, parse_calendar_request, CalendarEventProto,
+    CalendarResponseStatus, CalendarServiceRequest,
+};
 pub use types::{GarminError, RequestType, Result, Service};
 pub use watchdog::{
     HealthStatus, ReconnectReason, WatchdogConfig, WatchdogManager, WatchdogMetrics,

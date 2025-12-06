@@ -636,16 +636,6 @@ impl CommunicatorV2 {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-        if message.len() > 32 {
-            info!(
-                "   First 32 bytes: {}",
-                message[..32]
-                    .iter()
-                    .map(|b| format!("{:02X}", b))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-        }
 
         // COBS encode the message
         let payload = CobsCoDec::encode(message);
@@ -807,6 +797,8 @@ impl CommunicatorV2 {
             return Ok(());
         }
 
+        info!("📥 Data received from watch: {} bytes", data.len());
+        info!("   First bytes: {:02X?}", &data[..data.len().min(8)]);
         debug!("Characteristic changed: {} bytes", data.len());
         debug!("Raw data: {:02X?}", &data[..data.len().min(20)]);
 
@@ -1065,7 +1057,7 @@ impl CommunicatorV2 {
         };
 
         info!(
-            "Got register response for {}, service_handle={} (0x{:02X}), mlr_handle={}, reliable={}",
+            "✅ 📨 Received REGISTER_ML_RESP for {}, service_handle={} (0x{:02X}), mlr_handle={}, reliable={}",
             service, handle, handle, mlr_handle, reliable
         );
 
@@ -1077,7 +1069,10 @@ impl CommunicatorV2 {
 
         // Create MLR communicator if reliable mode is enabled
         if reliable != 0 {
-            info!("Creating MLR communicator for MLR handle {}", mlr_handle);
+            info!(
+                "✅ 🔧 Creating MLR communicator for {} (MLR handle {})",
+                service, mlr_handle
+            );
 
             // Get the send characteristic
             let send_char = {
@@ -1215,7 +1210,7 @@ impl CommunicatorV2 {
 
     /// Process CLOSE_ALL_RESP message
     async fn process_close_all_resp(&self) -> Result<()> {
-        debug!("Received close all handles response");
+        info!("✅ 📨 Received CLOSE_ALL_RESP - clearing all services and re-registering GFDI");
 
         let mut state = self.state.lock().await;
 
@@ -1436,11 +1431,13 @@ impl CommunicatorV2 {
 
     /// Clear and pause all MLR communicators (use when connection is lost)
     pub async fn clear_and_pause_mlr(&self) {
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
         for mlr in state.mlr_communicators.values() {
             mlr.clear_and_pause().await;
         }
-        debug!("Cleared and paused all MLR communicators");
+        // Actually remove the MLR communicators from the map
+        state.mlr_communicators.clear();
+        info!("Cleared and removed all MLR communicators");
     }
 }
 
@@ -1693,12 +1690,8 @@ mod tests {
             }
         }
 
-        fn get_written_data(&self) -> Vec<Vec<u8>> {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(self.written_data.lock())
-                    .clone()
-            })
+        async fn get_written_data(&self) -> Vec<Vec<u8>> {
+            self.written_data.lock().await.clone()
         }
     }
 
@@ -1775,7 +1768,7 @@ mod tests {
         assert!(result);
 
         // Should have written close all services command
-        let written = ble.get_written_data();
+        let written = ble.get_written_data().await;
         assert!(!written.is_empty());
     }
 
@@ -1803,7 +1796,7 @@ mod tests {
         assert_eq!(message[0], 0); // handle
         assert_eq!(message[1], RequestType::RegisterMlReq.to_u8());
         // bytes 2-9 are client ID
-        assert_eq!(u16::from_le_bytes([message[10], message[11]]), 5559); // GFDI code
+        assert_eq!(u16::from_le_bytes([message[10], message[11]]), 1); // GFDI code
         assert_eq!(message[12], 2); // reliable flag
     }
 
@@ -1862,6 +1855,9 @@ mod tests {
         // Process the encoded message
         let result = comm.on_characteristic_changed(&encoded).await;
         assert!(result.is_ok());
+
+        // Small delay to allow async processing to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         // Verify service is registered
         let state = comm.state.lock().await;

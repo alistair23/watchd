@@ -20,9 +20,10 @@ use bluer::{gatt::remote::Characteristic, Adapter, Address, Device, Session};
 use clap::Parser;
 use futures::stream::StreamExt;
 use garmin_v2_communicator::{
-    handle_http_request, AsyncGfdiMessageCallback, BleSupport, CharacteristicHandle,
-    CommunicatorV2, DataTransferHandler, HttpRequest, MessageGenerator, MessageParser, Transaction,
-    WatchdogConfig, WatchdogManager,
+    encode_calendar_response, handle_calendar_request, handle_http_request, parse_calendar_request,
+    AsyncGfdiMessageCallback, BleSupport, CalendarManager, CalendarResponseStatus,
+    CharacteristicHandle, CommunicatorV2, DataTransferHandler, HttpRequest, MessageGenerator,
+    MessageParser, Transaction, WatchdogConfig, WatchdogManager,
 };
 use std::collections::{HashMap, VecDeque};
 
@@ -90,6 +91,27 @@ struct Args {
     /// Enable duplicate notification detection (filters repeated content)
     #[arg(long)]
     enable_dedup: bool,
+
+    /// Enable calendar sync from GNOME Calendar / KOrganizer / URLs
+    #[arg(long)]
+    enable_calendar_sync: bool,
+
+    /// Calendar sync interval in minutes (default: 15)
+    #[arg(long, default_value = "15")]
+    calendar_sync_interval: u64,
+
+    /// Number of days to look ahead for calendar events (default: 7)
+    #[arg(long, default_value = "7")]
+    calendar_lookahead_days: i64,
+
+    /// Calendar URLs to fetch ICS files from (comma-separated)
+    /// Example: https://calendar.google.com/calendar/ical/.../basic.ics
+    #[arg(long)]
+    calendar_urls: Option<String>,
+
+    /// Cache duration for downloaded calendar ICS files in seconds (default: 300)
+    #[arg(long, default_value = "300")]
+    calendar_cache_duration: u64,
 }
 
 // ============================================================================
@@ -1400,6 +1422,17 @@ impl BlueRSupport {
         Ok(())
     }
 
+    /// Rediscover characteristics (useful after reconnection)
+    async fn rediscover_characteristics(
+        &self,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // Clear old characteristics
+        self.characteristics.lock().unwrap().clear();
+
+        // Discover new ones
+        self.discover_services().await
+    }
+
     /// Start notification listener with real-time bidirectional communication
     async fn start_notification_listener(
         &self,
@@ -1560,10 +1593,25 @@ impl Transaction for BlueRTransaction {
 }
 
 /// Async message handler that processes incoming messages and generates responses
+/// Pending protobuf chunk information
+#[derive(Clone)]
+struct PendingProtobufChunk {
+    /// Complete protobuf payload
+    complete_payload: Vec<u8>,
+    /// Total length of the protobuf data
+    total_length: usize,
+    /// Original message type (0x13B4 for ProtobufResponse)
+    #[allow(dead_code)]
+    message_type: u16,
+    /// Request ID
+    #[allow(dead_code)]
+    request_id: u16,
+}
+
 struct AsyncMessageHandler {
     communicator: Arc<Mutex<Option<Arc<CommunicatorV2>>>>,
     initialization_complete: Arc<Mutex<bool>>,
-    protobuf_request_id: Arc<Mutex<u32>>,
+    protobuf_request_id: Arc<Mutex<u16>>,
     notification_handler: Arc<Mutex<Option<Arc<GarminNotificationHandler>>>>,
     pairing_detected: Arc<Mutex<bool>>,
     skip_pairing: bool,
@@ -1571,7 +1619,13 @@ struct AsyncMessageHandler {
     send_semaphore: Arc<Semaphore>,
     watchdog: Arc<Mutex<Option<Arc<WatchdogManager>>>>,
     data_transfer_handler: Arc<DataTransferHandler>,
+    calendar_manager: Arc<Mutex<Option<Arc<CalendarManager>>>>,
+    /// Map of request_id -> pending protobuf chunks that need to be sent incrementally
+    pending_protobuf_chunks: Arc<Mutex<HashMap<u16, PendingProtobufChunk>>>,
 }
+
+/// Maximum protobuf data size per PROTOBUF_RESPONSE chunk (tested on Garmin devices)
+const MAX_PROTOBUF_CHUNK_SIZE: usize = 375;
 
 impl AsyncMessageHandler {
     fn new(skip_pairing: bool) -> Self {
@@ -1586,6 +1640,8 @@ impl AsyncMessageHandler {
             send_semaphore: Arc::new(Semaphore::new(1)),
             data_transfer_handler: Arc::new(DataTransferHandler::new()),
             watchdog: Arc::new(Mutex::new(None)),
+            calendar_manager: Arc::new(Mutex::new(None)),
+            pending_protobuf_chunks: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Start the message queue processor
@@ -1658,6 +1714,179 @@ impl AsyncMessageHandler {
 
     fn is_paired(&self) -> bool {
         *self.pairing_detected.lock().unwrap()
+    }
+
+    fn set_calendar_manager(&self, manager: Arc<CalendarManager>) {
+        *self.calendar_manager.lock().unwrap() = Some(manager);
+    }
+
+    /// Send a protobuf response, chunking it if necessary
+    /// This handles large protobuf messages that exceed MAX_PROTOBUF_CHUNK_SIZE
+    async fn send_protobuf_response(&self, message: Vec<u8>) -> garmin_v2_communicator::Result<()> {
+        // Parse the message to extract protobuf payload
+        if message.len() < 18 {
+            // Message too small to be a valid ProtobufResponse, send as-is
+            return self.send_response(&message).await;
+        }
+
+        // Extract fields from ProtobufResponse message
+        let message_id = u16::from_le_bytes([message[2], message[3]]);
+        if message_id != 0x13B4 {
+            // Not a ProtobufResponse, send as-is
+            return self.send_response(&message).await;
+        }
+
+        let request_id = u16::from_le_bytes([message[4], message[5]]);
+        let _data_offset = u32::from_le_bytes([message[6], message[7], message[8], message[9]]);
+        let total_length = u32::from_le_bytes([message[10], message[11], message[12], message[13]]);
+        let _data_length = u32::from_le_bytes([message[14], message[15], message[16], message[17]]);
+
+        // Extract protobuf payload (starts at byte 18, ends at -2 for checksum)
+        let protobuf_payload = message[18..message.len() - 2].to_vec();
+
+        println!("   📦 Checking protobuf message size:");
+        println!("      Total protobuf length: {} bytes", total_length);
+        println!("      Current chunk size: {} bytes", _data_length);
+        println!("      Max chunk size: {} bytes", MAX_PROTOBUF_CHUNK_SIZE);
+
+        // Check if we need to chunk
+        if protobuf_payload.len() <= MAX_PROTOBUF_CHUNK_SIZE {
+            // Small enough to send as-is
+            println!("   ✅ Message fits in one chunk, sending directly");
+            return self.send_response(&message).await;
+        }
+
+        // Need to chunk - store the complete payload and send first chunk
+        println!(
+            "   📦 Message too large, chunking into {}-byte chunks",
+            MAX_PROTOBUF_CHUNK_SIZE
+        );
+
+        // Store the pending chunk
+        {
+            let mut pending = self.pending_protobuf_chunks.lock().unwrap();
+            pending.insert(
+                request_id,
+                PendingProtobufChunk {
+                    complete_payload: protobuf_payload.clone(),
+                    total_length: protobuf_payload.len(),
+                    message_type: message_id,
+                    request_id,
+                },
+            );
+            println!("   📦 Stored pending chunk for request ID {}", request_id);
+        }
+
+        // Build first chunk
+        let first_chunk = &protobuf_payload[..MAX_PROTOBUF_CHUNK_SIZE];
+        self.send_protobuf_chunk(request_id, 0, first_chunk, protobuf_payload.len())
+            .await
+    }
+
+    /// Send a specific chunk of a protobuf message
+    async fn send_protobuf_chunk(
+        &self,
+        request_id: u16,
+        data_offset: u32,
+        chunk_data: &[u8],
+        total_length: usize,
+    ) -> garmin_v2_communicator::Result<()> {
+        println!("   📤 Sending protobuf chunk:");
+        println!("      Request ID: {}", request_id);
+        println!("      Offset: {}", data_offset);
+        println!("      Chunk size: {} bytes", chunk_data.len());
+        println!("      Total size: {} bytes", total_length);
+
+        // Build ProtobufResponse message with this chunk
+        let mut message = Vec::new();
+
+        // Packet size placeholder
+        message.extend_from_slice(&[0u8, 0u8]);
+
+        // Message ID: PROTOBUF_RESPONSE (5044 = 0x13B4)
+        message.extend_from_slice(&5044u16.to_le_bytes());
+
+        // Request ID
+        message.extend_from_slice(&request_id.to_le_bytes());
+
+        // Data offset
+        message.extend_from_slice(&data_offset.to_le_bytes());
+
+        // Total protobuf length
+        message.extend_from_slice(&(total_length as u32).to_le_bytes());
+
+        // Protobuf data length (size of this chunk)
+        message.extend_from_slice(&(chunk_data.len() as u32).to_le_bytes());
+
+        // Protobuf payload (this chunk)
+        message.extend_from_slice(chunk_data);
+
+        // Fill in packet size
+        let packet_size = (message.len() + 2) as u16;
+        message[0..2].copy_from_slice(&packet_size.to_le_bytes());
+
+        // Add checksum (CRC-16)
+        let checksum = compute_crc16(&message);
+        message.extend_from_slice(&checksum.to_le_bytes());
+
+        println!("   📤 Chunk message size: {} bytes", message.len());
+
+        // Send the chunk
+        self.send_response(&message).await
+    }
+
+    /// Handle ACK for a protobuf chunk - send next chunk if needed
+    async fn handle_protobuf_chunk_ack(
+        &self,
+        request_id: u16,
+        data_offset: u32,
+    ) -> garmin_v2_communicator::Result<()> {
+        let pending_chunk = {
+            let pending = self.pending_protobuf_chunks.lock().unwrap();
+            pending.get(&request_id).cloned()
+        };
+
+        if let Some(chunk_info) = pending_chunk {
+            let next_offset = data_offset as usize + MAX_PROTOBUF_CHUNK_SIZE;
+
+            println!("   📦 Checking for next chunk:");
+            println!("      Current offset after ACK: {}", data_offset);
+            println!("      Next offset: {}", next_offset);
+            println!("      Total length: {}", chunk_info.total_length);
+
+            if next_offset < chunk_info.total_length {
+                // More chunks to send
+                let remaining = chunk_info.total_length - next_offset;
+                let chunk_size = remaining.min(MAX_PROTOBUF_CHUNK_SIZE);
+                let next_chunk =
+                    &chunk_info.complete_payload[next_offset..next_offset + chunk_size];
+
+                println!(
+                    "   📤 Sending next chunk (offset {}, {} bytes)",
+                    next_offset, chunk_size
+                );
+
+                self.send_protobuf_chunk(
+                    request_id,
+                    next_offset as u32,
+                    next_chunk,
+                    chunk_info.total_length,
+                )
+                .await?;
+            } else {
+                // All chunks sent, remove from pending
+                println!("   ✅ All chunks sent for request ID {}", request_id);
+                let mut pending = self.pending_protobuf_chunks.lock().unwrap();
+                pending.remove(&request_id);
+            }
+        } else {
+            println!(
+                "   ℹ️  No pending chunk found for request ID {}",
+                request_id
+            );
+        }
+
+        Ok(())
     }
 
     async fn send_response(&self, response: &[u8]) -> garmin_v2_communicator::Result<()> {
@@ -2107,6 +2336,28 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                                 println!("      Original message ID: 0x{:04X}", original_msg_id);
                                 println!("      Status byte: 0x{:02X}", status);
 
+                                // Check if this is an ACK for a ProtobufResponse (0x13B4) - need to send next chunk
+                                if original_msg_id == 0x13B4 && status == 0 && data.len() >= 11 {
+                                    let request_id = u16::from_le_bytes([data[3], data[4]]);
+                                    let data_offset =
+                                        u32::from_le_bytes([data[5], data[6], data[7], data[8]]);
+
+                                    println!("   📨 ACK for ProtobufResponse chunk");
+                                    println!("      Request ID: {}", request_id);
+                                    println!("      Data offset: {}", data_offset);
+
+                                    // Handle the chunk ACK (send next chunk if needed)
+                                    if let Err(e) = self
+                                        .handle_protobuf_chunk_ack(request_id, data_offset)
+                                        .await
+                                    {
+                                        eprintln!(
+                                            "   ❌ Failed to handle protobuf chunk ACK: {}",
+                                            e
+                                        );
+                                    }
+                                }
+
                                 // Check if this is a response to NotificationData (0x13AB = 5035)
                                 if original_msg_id == 0x13AB {
                                     let transfer_status = if data.len() > 3 { data[3] } else { 0 };
@@ -2285,30 +2536,216 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                                             // Field 1 is calendar_service or core_service
                                             if field_number == 1 && wire_type == 2 {
                                                 println!("   ℹ️  Detected CalendarService/CoreService request (field 1)");
-                                                println!("   💡 This is not an HTTP request - sending ACK");
 
-                                                // Send ACK for calendar/core service
-                                                let mut response_payload = vec![
-                                                    0xB3,
-                                                    0x13, // Original message ID: ProtobufRequest (5043)
-                                                    0x00, // Status: ACK
-                                                ];
-                                                response_payload
-                                                    .extend_from_slice(&request_id.to_le_bytes());
-                                                response_payload
-                                                    .extend_from_slice(&data_offset.to_le_bytes());
-                                                response_payload.push(0x00); // ProtobufChunkStatus: KEPT
-                                                response_payload.push(0x00); // ProtobufStatusCode: NO_ERROR
+                                                // Try to parse as calendar request
+                                                match parse_calendar_request(protobuf_payload) {
+                                                    Ok(calendar_request) => {
+                                                        println!("   📅 Calendar Service Request detected!");
+                                                        println!(
+                                                            "      Time range: {} to {}",
+                                                            calendar_request.start_date,
+                                                            calendar_request.end_date
+                                                        );
+                                                        println!(
+                                                            "      Max events: {}",
+                                                            calendar_request.max_events
+                                                        );
+                                                        println!(
+                                                            "      Include all-day: {}",
+                                                            calendar_request.include_all_day
+                                                        );
 
-                                                let response =
-                                                    wrap_in_gfdi_envelope(5000, &response_payload);
+                                                        // Send ACK first before processing calendar request
+                                                        println!("      📤 Sending ACK for calendar request...");
+                                                        let mut ack_payload = vec![
+                                                            0xB3,
+                                                            0x13, // Original message ID: ProtobufRequest (5043)
+                                                            0x00, // Status: ACK
+                                                        ];
+                                                        ack_payload.extend_from_slice(
+                                                            &request_id.to_le_bytes(),
+                                                        );
+                                                        ack_payload.extend_from_slice(
+                                                            &data_offset.to_le_bytes(),
+                                                        );
+                                                        ack_payload.push(0x00); // ProtobufChunkStatus: KEPT
+                                                        ack_payload.push(0x00); // ProtobufStatusCode: NO_ERROR
 
-                                                // Use queue to ensure proper message ordering
-                                                if let Err(e) = self.send_response(&response).await
-                                                {
-                                                    eprintln!("   ❌ Failed to queue ACK: {}", e);
-                                                } else {
-                                                    println!("   ✅ Generic ACK queued");
+                                                        let ack_response = wrap_in_gfdi_envelope(
+                                                            5000,
+                                                            &ack_payload,
+                                                        );
+
+                                                        if let Err(e) =
+                                                            self.send_response(&ack_response).await
+                                                        {
+                                                            eprintln!(
+                                                                "      ❌ Failed to send ACK: {}",
+                                                                e
+                                                            );
+                                                        } else {
+                                                            println!("      ✅ Calendar request ACK sent");
+                                                        }
+
+                                                        // Get calendar manager
+                                                        let calendar_manager = self
+                                                            .calendar_manager
+                                                            .lock()
+                                                            .unwrap()
+                                                            .clone();
+
+                                                        if calendar_manager.is_none() {
+                                                            println!("      ⚠️  Calendar manager not initialized - sending empty response");
+                                                        }
+
+                                                        // Handle the calendar request asynchronously with timeout
+                                                        let calendar_mgr_opt = calendar_manager
+                                                            .as_ref()
+                                                            .map(|m| m.as_ref());
+
+                                                        println!(
+                                                            "      🔄 Fetching calendar events..."
+                                                        );
+                                                        let fetch_result = tokio::time::timeout(
+                                                            Duration::from_secs(5),
+                                                            handle_calendar_request(
+                                                                &calendar_request,
+                                                                calendar_mgr_opt,
+                                                            ),
+                                                        )
+                                                        .await;
+
+                                                        match fetch_result {
+                                                            Ok(Ok(events)) => {
+                                                                println!("      ✅ Fetched {} calendar events", events.len());
+
+                                                                // Encode the calendar response
+                                                                let response_data = encode_calendar_response(
+                                                                    &events,
+                                                                    CalendarResponseStatus::Ok,
+                                                                    request_id,
+                                                                    calendar_request.use_core_service_envelope,
+                                                                );
+
+                                                                // Wrap in GFDI envelope with message ID 0x13B4 (ProtobufResponse = 5044)
+                                                                let response =
+                                                                    wrap_in_gfdi_envelope(
+                                                                        0x13B4,
+                                                                        &response_data,
+                                                                    );
+
+                                                                println!(
+                                                                    "      📤 Sending calendar response ({} bytes)",
+                                                                    response_data.len()
+                                                                );
+
+                                                                // Send the response
+                                                                match {
+                                                                    let comm = self
+                                                                        .communicator
+                                                                        .lock()
+                                                                        .unwrap()
+                                                                        .as_ref()
+                                                                        .unwrap()
+                                                                        .clone();
+                                                                    comm.send_message("calendar_response", &response)
+                                                                        .await
+                                                                } {
+                                                                    Ok(_) => println!(
+                                                                        "      ✅ Calendar response sent successfully!"
+                                                                    ),
+                                                                    Err(e) => eprintln!(
+                                                                        "      ❌ Failed to send calendar response: {}",
+                                                                        e
+                                                                    ),
+                                                                }
+                                                            }
+                                                            Err(_timeout) => {
+                                                                eprintln!(
+                                                                    "      ❌ Calendar request timeout"
+                                                                );
+
+                                                                // Send error response
+                                                                let response_data = encode_calendar_response(
+                                                                    &[],
+                                                                    CalendarResponseStatus::InvalidDateRange,
+                                                                    request_id,
+                                                                    calendar_request.use_core_service_envelope,
+                                                                );
+
+                                                                let response =
+                                                                    wrap_in_gfdi_envelope(
+                                                                        0x13B4,
+                                                                        &response_data,
+                                                                    );
+
+                                                                match {
+                                                                    let comm = self
+                                                                        .communicator
+                                                                        .lock()
+                                                                        .unwrap()
+                                                                        .as_ref()
+                                                                        .unwrap()
+                                                                        .clone();
+                                                                    comm.send_message(
+                                                                        "calendar_error_response",
+                                                                        &response,
+                                                                    )
+                                                                    .await
+                                                                } {
+                                                                    Ok(_) => println!(
+                                                                        "      ✅ Calendar error response sent"
+                                                                    ),
+                                                                    Err(e) => eprintln!(
+                                                                        "      ❌ Failed to send error response: {}",
+                                                                        e
+                                                                    ),
+                                                                }
+                                                            }
+                                                            Ok(Err(e)) => {
+                                                                eprintln!(
+                                                                    "      ❌ Calendar fetch error: {}",
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        println!("      ⚠️  Not a calendar request or parse error: {}", e);
+                                                        println!("      💡 Sending generic ACK");
+
+                                                        // Send ACK for non-calendar CoreService requests
+                                                        let mut response_payload = vec![
+                                                            0xB3,
+                                                            0x13, // Original message ID: ProtobufRequest (5043)
+                                                            0x00, // Status: ACK
+                                                        ];
+                                                        response_payload.extend_from_slice(
+                                                            &request_id.to_le_bytes(),
+                                                        );
+                                                        response_payload.extend_from_slice(
+                                                            &data_offset.to_le_bytes(),
+                                                        );
+                                                        response_payload.push(0x00); // ProtobufChunkStatus: KEPT
+                                                        response_payload.push(0x00); // ProtobufStatusCode: NO_ERROR
+
+                                                        let response = wrap_in_gfdi_envelope(
+                                                            5000,
+                                                            &response_payload,
+                                                        );
+
+                                                        // Use queue to ensure proper message ordering
+                                                        if let Err(e) =
+                                                            self.send_response(&response).await
+                                                        {
+                                                            eprintln!(
+                                                                "   ❌ Failed to queue ACK: {}",
+                                                                e
+                                                            );
+                                                        } else {
+                                                            println!("   ✅ Generic ACK queued");
+                                                        }
+                                                    }
                                                 }
                                             }
                                             // Field 2 is http_service (HTTP requests over Bluetooth)
@@ -2356,14 +2793,7 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                                                                 ) {
                                                                     Ok(response) => {
                                                                         println!("   ✅ Sending ProtobufResponse with HTTP data");
-                                                                        let comm = self
-                                                                            .communicator
-                                                                            .lock()
-                                                                            .unwrap()
-                                                                            .as_ref()
-                                                                            .unwrap()
-                                                                            .clone();
-                                                                        match comm.send_message("http_response", &response).await {
+                                                                        match self.send_protobuf_response(response).await {
                                                                             Ok(_) => {
                                                                                 println!("   ✅ HTTP response sent successfully!")
                                                                             }
@@ -2787,14 +3217,14 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                                                                 ) {
                                                                     Ok(response) => {
                                                                         println!("   ✅ Sending ProtobufResponse with HTTP data");
-                                                                        // Use queue to ensure proper message ordering
+                                                                        // Use chunking-aware send for protobuf responses
                                                                         if let Err(e) = self
-                                                                            .send_response(
-                                                                                &response,
+                                                                            .send_protobuf_response(
+                                                                                response,
                                                                             )
                                                                             .await
                                                                         {
-                                                                            eprintln!("   ❌ Failed to queue HTTP response: {}", e);
+                                                                            eprintln!("   ❌ Failed to send HTTP response: {}", e);
                                                                         } else {
                                                                             println!("   ✅ HTTP response queued");
                                                                         }
@@ -3546,6 +3976,24 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             "disabled (all notifications pass through)"
         }
     );
+    println!(
+        "📅 Calendar sync: {}",
+        if args.enable_calendar_sync {
+            format!(
+                "enabled (every {} min, {} days lookahead)",
+                args.calendar_sync_interval, args.calendar_lookahead_days
+            )
+        } else {
+            "disabled".to_string()
+        }
+    );
+    if let Some(ref urls) = args.calendar_urls {
+        let url_count = urls.split(',').filter(|s| !s.trim().is_empty()).count();
+        println!(
+            "   📡 URL calendars: {} configured (cache: {}s)",
+            url_count, args.calendar_cache_duration
+        );
+    }
     println!("🔄 Auto-reconnect: enabled");
 
     // Main reconnection loop (watchdog will handle most reconnections internally)
@@ -3611,6 +4059,74 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
     let adapter_name = adapter.name();
     println!("   Using adapter: {}", adapter_name);
 
+    // Ensure Bluetooth adapter is powered on
+    match adapter.is_powered().await {
+        Ok(true) => {
+            println!("   ✅ Bluetooth adapter is powered on");
+        }
+        Ok(false) => {
+            println!("   ⚠️  Bluetooth adapter is off, attempting to turn it on...");
+
+            // First try: Use rfkill to unblock Bluetooth
+            println!("   🔧 Attempting: rfkill unblock bluetooth");
+            match std::process::Command::new("rfkill")
+                .args(&["unblock", "bluetooth"])
+                .output()
+            {
+                Ok(output) => {
+                    if output.status.success() {
+                        println!("   ✅ rfkill unblock bluetooth succeeded");
+                        sleep(Duration::from_millis(500)).await;
+                    } else {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        println!("   ⚠️  rfkill command failed: {}", stderr);
+                    }
+                }
+                Err(e) => {
+                    println!("   ⚠️  Could not run rfkill: {}", e);
+                }
+            }
+
+            // Second try: Use adapter API to power on
+            match adapter.set_powered(true).await {
+                Ok(_) => {
+                    // Wait a moment for adapter to fully power on
+                    sleep(Duration::from_secs(2)).await;
+                    println!("   ✅ Bluetooth adapter powered on");
+                }
+                Err(e) => {
+                    println!("   ❌ Failed to power on Bluetooth adapter: {}", e);
+                    println!();
+                    println!("   ⚠️  Automatic Bluetooth enabling failed.");
+                    println!("   Please turn on Bluetooth manually using ONE of these methods:");
+                    println!();
+                    println!("   Option 1 - Using bluetoothctl:");
+                    println!("      bluetoothctl power on");
+                    println!();
+                    println!("   Option 2 - Using rfkill with sudo:");
+                    println!("      sudo rfkill unblock bluetooth");
+                    println!();
+                    println!("   Option 3 - Using system settings:");
+                    println!("      Enable Bluetooth in your desktop environment's settings");
+                    println!();
+                    println!("   Option 4 - Run this application with elevated privileges:");
+                    println!(
+                        "      sudo -E cargo run --example notification_dbus_monitor -- {}",
+                        args.mac_address
+                    );
+                    println!();
+                    return Err(Box::new(std::io::Error::other(
+                        "Bluetooth adapter is off and could not be powered on automatically",
+                    )));
+                }
+            }
+        }
+        Err(e) => {
+            println!("   ⚠️  Could not check Bluetooth power state: {}", e);
+            println!("   Continuing anyway - if connection fails, ensure Bluetooth is enabled");
+        }
+    }
+
     // Connect to device
     println!("\n2️⃣  Connecting to Garmin device...");
     let ble_support = match BlueRSupport::new(&adapter, &args.mac_address).await {
@@ -3642,6 +4158,89 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
     // Set up async message handler BEFORE initialization
     let async_handler = Arc::new(AsyncMessageHandler::new(args.skip_pairing));
     communicator.set_async_message_callback(async_handler.clone());
+
+    // Initialize calendar manager early if calendar sync is enabled
+    // This must happen BEFORE the watch connects to avoid race conditions
+    if args.enable_calendar_sync {
+        println!("\n4.5️⃣  Initializing calendar manager...");
+
+        // Start with default providers (GNOME Calendar, KOrganizer)
+        let mut manager_result = CalendarManager::new().await;
+
+        // If URL calendars are specified, add URL provider
+        if let Some(urls_str) = &args.calendar_urls {
+            let urls: Vec<String> = urls_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            if !urls.is_empty() {
+                println!("   📡 Adding {} URL calendar(s)...", urls.len());
+                for url in &urls {
+                    println!("      - {}", url);
+                }
+
+                match &mut manager_result {
+                    Ok(manager) => {
+                        // Add URL provider to existing manager
+                        if let Err(e) = manager.add_url_provider(urls, args.calendar_cache_duration)
+                        {
+                            eprintln!("   ⚠️  Failed to add URL calendar provider: {}", e);
+                        } else {
+                            println!(
+                                "   ✅ URL calendar provider added (cache: {}s)",
+                                args.calendar_cache_duration
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        // No local providers available, try just URL provider
+                        use garmin_v2_communicator::calendar::UrlCalendarProvider;
+                        match UrlCalendarProvider::new(urls, args.calendar_cache_duration) {
+                            Ok(provider) => {
+                                match CalendarManager::with_providers(vec![Box::new(provider)]) {
+                                    Ok(mgr) => {
+                                        manager_result = Ok(mgr);
+                                        println!(
+                                            "   ✅ URL calendar provider added (cache: {}s)",
+                                            args.calendar_cache_duration
+                                        );
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "   ⚠️  Failed to create manager with URL provider: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("   ⚠️  Failed to create URL calendar provider: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        match manager_result {
+            Ok(manager) => {
+                println!(
+                    "   ✅ Calendar manager initialized with {} provider(s)",
+                    manager.provider_count()
+                );
+                let manager_arc = Arc::new(manager);
+                async_handler.set_calendar_manager(manager_arc.clone());
+                println!("   ✅ Calendar manager registered (ready for watch requests)");
+            }
+            Err(e) => {
+                eprintln!("   ⚠️  Failed to initialize calendar manager: {}", e);
+                eprintln!("   ℹ️  Calendar sync will be disabled");
+                eprintln!("   💡 Tip: Install GNOME Calendar/KOrganizer or use --calendar-urls");
+            }
+        }
+    }
 
     // First, just find and set up the characteristics (don't send requests yet)
     println!("\n5️⃣  Finding Garmin ML characteristics...");
@@ -3872,6 +4471,7 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
     let handler_for_reconnect = handler.clone();
     let communicator_for_reconnect = communicator.clone();
     let mac_address_for_reconnect = args.mac_address.clone();
+    let adapter_for_reconnect = adapter.clone();
 
     tokio::spawn(async move {
         loop {
@@ -3923,6 +4523,51 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                         reconnect_attempts, max_attempts
                     );
 
+                    // Ensure Bluetooth adapter is powered on before attempting reconnection
+                    match adapter_for_reconnect.is_powered().await {
+                        Ok(true) => {
+                            // Adapter is on, good to proceed
+                        }
+                        Ok(false) => {
+                            eprintln!("   ⚠️  Bluetooth adapter is off, attempting to enable...");
+
+                            // Try rfkill unblock
+                            eprintln!("   🔧 Running: rfkill unblock bluetooth");
+                            match std::process::Command::new("rfkill")
+                                .args(&["unblock", "bluetooth"])
+                                .output()
+                            {
+                                Ok(output) => {
+                                    if output.status.success() {
+                                        eprintln!("   ✅ rfkill succeeded, waiting for adapter...");
+                                        sleep(Duration::from_millis(500)).await;
+
+                                        // Try to power on via adapter API
+                                        if let Ok(_) = adapter_for_reconnect.set_powered(true).await
+                                        {
+                                            sleep(Duration::from_secs(1)).await;
+                                            eprintln!("   ✅ Bluetooth adapter powered on");
+                                        }
+                                    } else {
+                                        eprintln!("   ⚠️  rfkill failed, skipping this attempt");
+                                        sleep(Duration::from_secs(10)).await;
+                                        continue;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("   ⚠️  Could not run rfkill: {}", e);
+                                    eprintln!("   💡 Please enable Bluetooth manually");
+                                    sleep(Duration::from_secs(10)).await;
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("   ⚠️  Could not check Bluetooth power: {}", e);
+                            // Continue anyway, might still work
+                        }
+                    }
+
                     // Wait before attempting
                     let backoff = Duration::from_secs(5 * reconnect_attempts.min(6));
                     sleep(backoff).await;
@@ -3932,27 +4577,81 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                         Ok(_) => {
                             eprintln!("   ✅ BLE connected!");
 
-                            // Small delay to ensure listener is fully settled
-                            sleep(Duration::from_secs(3)).await;
+                            // Wait for BLE connection to fully stabilize
+                            // The watch needs time to be ready after reconnection
+                            eprintln!("   ⏳ Waiting for connection to stabilize (5 seconds)...");
+                            sleep(Duration::from_secs(5)).await;
 
-                            // NOW re-initialize to send requests - listener will catch responses!
-                            println!(
-                                "\n7️⃣  Re-initializing to send requests (listener is ready)..."
-                            );
+                            // Re-discover characteristics after reconnection
+                            eprintln!("   🔍 Re-discovering characteristics...");
+                            if let Err(e) = ble_for_reconnect.rediscover_characteristics().await {
+                                eprintln!("   ❌ Failed to discover characteristics: {}", e);
+                                continue;
+                            }
+                            eprintln!("   ✅ Characteristics re-discovered");
+
+                            // Find the receive characteristic UUID manually without sending CLOSE_ALL_REQ
+                            eprintln!("   🔍 Finding Garmin ML receive characteristic...");
+                            let mut receive_uuid: Option<String> = None;
+                            for i in 0x2810..=0x2814 {
+                                let test_uuid =
+                                    format!("6A4E{:04X}-667B-11E3-949A-0800200C9A66", i);
+                                if ble_for_reconnect.get_characteristic(&test_uuid).is_some() {
+                                    receive_uuid = Some(test_uuid);
+                                    eprintln!(
+                                        "   ✅ Found characteristic: {}...",
+                                        &receive_uuid.as_ref().unwrap()[..20]
+                                    );
+                                    break;
+                                }
+                            }
+
+                            let receive_uuid = match receive_uuid {
+                                Some(uuid) => uuid,
+                                None => {
+                                    eprintln!("   ❌ No Garmin ML characteristic found");
+                                    continue;
+                                }
+                            };
+
+                            // RESTART notification listener FIRST - before sending any requests!
+                            eprintln!("   📡 Restarting notification listener...");
+
+                            match ble_for_reconnect
+                                .start_notification_listener(
+                                    &receive_uuid,
+                                    communicator_for_reconnect.clone(),
+                                    Some(watchdog_for_reconnect.clone()),
+                                )
+                                .await
+                            {
+                                Ok(_) => {
+                                    eprintln!("   ✅ Listener restarted successfully");
+                                }
+                                Err(e) => {
+                                    eprintln!("   ❌ Failed to restart listener: {}", e);
+                                    continue;
+                                }
+                            }
+
+                            // Give the listener time to fully activate
+                            eprintln!("   ⏳ Waiting for listener to stabilize (5 seconds)...");
+                            sleep(Duration::from_secs(5)).await;
+
+                            // NOW initialize device and send CLOSE_ALL_REQ - listener is ready!
+                            eprintln!("\n7️⃣  Initializing device (listener is ready)...");
+                            eprintln!("   📤 This will send CLOSE_ALL_REQ to the watch");
                             match communicator_for_reconnect.initialize_device().await {
                                 Ok(true) => {
-                                    println!("   ✅ CLOSE_ALL_REQ sent");
-                                    println!("   ✅ REGISTER_ML_REQ sent");
-                                    println!("   ℹ️  Waiting for watch responses...");
+                                    eprintln!("   ✅ CLOSE_ALL_REQ sent");
+                                    eprintln!("   ℹ️  Waiting for CLOSE_ALL_RESP and service registration...");
                                 }
                                 Ok(false) => {
-                                    println!(
-                                        "   ⚠️  Re-initialization returned false (unexpected)"
-                                    );
+                                    eprintln!("   ⚠️  Initialization failed");
                                     continue;
                                 }
                                 Err(e) => {
-                                    println!("   ❌ Re-initialization error: {}", e);
+                                    eprintln!("   ❌ Initialization error: {}", e);
                                     continue;
                                 }
                             }
@@ -3999,6 +4698,12 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
     println!("   All notifications will be forwarded to your Garmin watch.");
     println!("   🛡️  Watchdog: Auto-reconnect on connection loss");
     println!("   📥 Missed notifications will be queued and replayed on reconnect");
+    if args.enable_calendar_sync {
+        println!(
+            "   📅 Calendar sync: Enabled (checking every {} minutes)",
+            args.calendar_sync_interval
+        );
+    }
     println!("   Press Ctrl+C to exit.");
     println!();
 
@@ -4017,6 +4722,14 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
     // Start listening for messages
     let mut stream = zbus::MessageStream::from(&connection);
     let mut last_metrics = std::time::Instant::now();
+    let mut last_calendar_sync = std::time::Instant::now();
+
+    // Get calendar manager reference (already initialized earlier)
+    let calendar_manager = if args.enable_calendar_sync {
+        async_handler.calendar_manager.lock().unwrap().clone()
+    } else {
+        None
+    };
 
     loop {
         tokio::select! {
@@ -4050,6 +4763,46 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                         metrics.total_reconnects
                     );
                     last_metrics = std::time::Instant::now();
+                }
+
+                // Check if it's time to sync calendar
+                if let Some(ref manager) = calendar_manager {
+                    let sync_interval = Duration::from_secs(args.calendar_sync_interval * 60);
+                    if last_calendar_sync.elapsed() >= sync_interval {
+                        println!("📅 Syncing calendar events...");
+
+                        let now = chrono::Utc::now().timestamp();
+                        let lookahead = args.calendar_lookahead_days * 86400;
+                        let end_time = now + lookahead;
+
+                        match manager.fetch_events(now, end_time, 100, true).await {
+                            Ok(events) => {
+                                println!("   ✅ Fetched {} calendar events", events.len());
+
+                                // TODO: Send calendar events to watch via protobuf
+                                // This requires implementing the CalendarService protobuf handler
+                                // similar to how notifications are sent
+
+                                if !events.is_empty() {
+                                    println!("   📋 Upcoming events:");
+                                    for (i, event) in events.iter().take(5).enumerate() {
+                                        let start_time = chrono::DateTime::from_timestamp(event.start_timestamp, 0)
+                                            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                                            .unwrap_or_else(|| "Unknown".to_string());
+                                        println!("      {}. {} - {}", i + 1, event.title, start_time);
+                                    }
+                                    if events.len() > 5 {
+                                        println!("      ... and {} more", events.len() - 5);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("   ⚠️  Failed to fetch calendar events: {}", e);
+                            }
+                        }
+
+                        last_calendar_sync = std::time::Instant::now();
+                    }
                 }
             }
         }
