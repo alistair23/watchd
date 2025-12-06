@@ -1239,6 +1239,28 @@ impl GarminNotificationHandler {
                     .unwrap()
                     .insert(id, call_spec.clone());
 
+                // Also store as NotificationSpec so watch can retrieve details
+                let notification_spec = NotificationSpec::new(id, NotificationType::GenericPhone)
+                    .with_title(
+                        call_spec
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| "Incoming Call".to_string()),
+                    )
+                    .with_body(format!("From: {}", call_spec.number))
+                    .with_sender(
+                        call_spec
+                            .source_name
+                            .clone()
+                            .unwrap_or_else(|| "Phone".to_string()),
+                    )
+                    .with_phone_number(call_spec.number.clone());
+
+                self.stored_notifications
+                    .lock()
+                    .unwrap()
+                    .insert(id, notification_spec);
+
                 let update_msg = NotificationUpdateMessageBuilder::new(
                     NotificationUpdateType::Add,
                     NotificationType::GenericPhone,
@@ -1282,6 +1304,7 @@ impl GarminNotificationHandler {
             CallCommand::End | CallCommand::Reject => {
                 println!("❌ Call ended/rejected");
                 self.active_notifications.lock().unwrap().remove(&id);
+                self.stored_notifications.lock().unwrap().remove(&id);
 
                 let remove_msg = NotificationUpdateMessageBuilder::new(
                     NotificationUpdateType::Remove,
@@ -1394,6 +1417,33 @@ impl BlueRSupport {
 
     async fn discover_services(&self) -> std::result::Result<(), Box<dyn std::error::Error>> {
         println!("🔍 Discovering services...");
+
+        // Wait for GATT services to be resolved
+        println!("   ⏳ Waiting for GATT services to be resolved...");
+        let mut attempts = 0;
+        const MAX_ATTEMPTS: u32 = 30; // 30 seconds max
+
+        loop {
+            match self.device.is_services_resolved().await {
+                Ok(true) => {
+                    println!("   ✅ GATT services resolved");
+                    break;
+                }
+                Ok(false) => {
+                    attempts += 1;
+                    if attempts >= MAX_ATTEMPTS {
+                        return Err("Timeout waiting for GATT services to be resolved".into());
+                    }
+                    sleep(Duration::from_secs(1)).await;
+                }
+                Err(e) => {
+                    println!("   ⚠️  Could not check services resolved status: {}", e);
+                    // Continue anyway after a short delay
+                    sleep(Duration::from_secs(2)).await;
+                    break;
+                }
+            }
+        }
 
         // Get all services
         let services = self.device.services().await?;
@@ -1674,9 +1724,7 @@ impl AsyncMessageHandler {
 
                     if let Some(communicator) = comm_ref {
                         match communicator.send_message("queued_message", &msg).await {
-                            Ok(()) => {
-                                println!("   ✅ [QUEUE] Message sent successfully");
-                            }
+                            Ok(()) => {}
                             Err(e) => {
                                 eprintln!("   ❌ [QUEUE] Failed to send message: {}", e);
                             }
@@ -3687,8 +3735,8 @@ async fn handle_dbus_notification(
             );
             seen.insert(content_key);
 
-            // Cleanup old entries (keep last 50)
-            if seen.len() > 50 {
+            // Cleanup old entries (keep last 5)
+            if seen.len() > 5 {
                 let keys_to_remove: Vec<_> = seen.iter().take(20).cloned().collect();
                 for key in keys_to_remove {
                     seen.remove(&key);
@@ -3729,6 +3777,82 @@ async fn handle_dbus_notification(
     Ok(())
 }
 
+async fn handle_modemmanager_call(
+    msg: &zbus::Message,
+    handler: &GarminNotificationHandler,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Parse PropertiesChanged signal: "sa{sv}as"
+    let (interface_name, changed_properties, _invalidated): (
+        String,
+        HashMap<String, zbus::zvariant::OwnedValue>,
+        Vec<String>,
+    ) = msg.body().deserialize()?;
+
+    println!(
+        "🔍 ModemManager PropertiesChanged: interface={}",
+        interface_name
+    );
+
+    // Check if this is a Voice interface change
+    if interface_name != "org.freedesktop.ModemManager1.Modem.Voice" {
+        return Ok(());
+    }
+
+    println!("   ℹ️  Voice interface properties changed");
+    println!(
+        "   Properties: {:?}",
+        changed_properties.keys().collect::<Vec<_>>()
+    );
+
+    // Check if Calls array changed
+    if let Some(calls_value) = changed_properties.get("Calls") {
+        // Parse calls array
+        let calls: Vec<zbus::zvariant::OwnedObjectPath> = if let Ok(v) = calls_value.try_clone() {
+            match zbus::zvariant::Value::try_from(v) {
+                Ok(value) => {
+                    if let Some(array) =
+                        <Vec<zbus::zvariant::OwnedObjectPath>>::try_from(value).ok()
+                    {
+                        array
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Err(_) => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
+        if !calls.is_empty() {
+            println!("📞 ModemManager: Incoming call detected!");
+            println!("   Call path: {}", calls[0].as_str());
+
+            // Get call details from ModemManager
+            // For now, create a basic call notification
+            let call_spec = CallSpec::new(
+                "Unknown".to_string(), // Phone number - need to query ModemManager
+                CallCommand::Incoming,
+            )
+            .with_name("Incoming Call".to_string());
+
+            println!("   📱 Sending incoming call notification to watch...");
+            if let Err(e) = handler.on_set_call_state(call_spec).await {
+                eprintln!("   ❌ Failed to send call notification: {}", e);
+            } else {
+                println!("   ✅ Call notification sent to watch!");
+            }
+        } else {
+            println!("📞 ModemManager: Call ended");
+            // Send call end notification
+            let call_spec = CallSpec::new("Unknown".to_string(), CallCommand::End);
+            let _ = handler.on_set_call_state(call_spec).await;
+        }
+    }
+
+    Ok(())
+}
+
 fn map_app_to_notification_type(
     app_name: &str,
     hints: &HashMap<String, zbus::zvariant::OwnedValue>,
@@ -3748,11 +3872,6 @@ fn map_app_to_notification_type(
             // Email
             if cat_lower.contains("email") {
                 return NotificationType::GenericEmail;
-            }
-
-            // Phone calls
-            if cat_lower.contains("call") || cat_lower.contains("phone") {
-                return NotificationType::GenericPhone;
             }
 
             // Social media / presence
@@ -3828,14 +3947,6 @@ fn map_app_to_notification_type(
                 || entry_lower.contains("organizer")
             {
                 return NotificationType::GenericCalendar;
-            }
-
-            // Phone/dialer apps
-            if entry_lower.contains("phone")
-                || entry_lower.contains("dialer")
-                || entry_lower.contains("call")
-            {
-                return NotificationType::GenericPhone;
             }
         }
     }
@@ -3924,15 +4035,6 @@ fn map_app_to_notification_type(
         || app_lower.contains("stopwatch")
     {
         return NotificationType::GenericAlarmClock;
-    }
-
-    // Phone and dialer apps
-    if app_lower.contains("call")
-        || app_lower.contains("phone")
-        || app_lower.contains("dialer")
-        || app_lower.contains("voip")
-    {
-        return NotificationType::GenericPhone;
     }
 
     // Navigation apps
@@ -4579,8 +4681,8 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
 
                             // Wait for BLE connection to fully stabilize
                             // The watch needs time to be ready after reconnection
-                            eprintln!("   ⏳ Waiting for connection to stabilize (5 seconds)...");
-                            sleep(Duration::from_secs(5)).await;
+                            eprintln!("   ⏳ Waiting for connection to stabilize...");
+                            sleep(Duration::from_secs(3)).await;
 
                             // Re-discover characteristics after reconnection
                             eprintln!("   🔍 Re-discovering characteristics...");
@@ -4635,8 +4737,8 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                             }
 
                             // Give the listener time to fully activate
-                            eprintln!("   ⏳ Waiting for listener to stabilize (5 seconds)...");
-                            sleep(Duration::from_secs(5)).await;
+                            eprintln!("   ⏳ Waiting for listener to stabilize...");
+                            sleep(Duration::from_secs(3)).await;
 
                             // NOW initialize device and send CLOSE_ALL_REQ - listener is ready!
                             eprintln!("\n7️⃣  Initializing device (listener is ready)...");
@@ -4686,7 +4788,14 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                 }
 
                 if reconnect_attempts >= max_attempts {
-                    panic!("Max reconnection attempts reached\n");
+                    eprintln!(
+                        "   ⚠️  Max reconnection attempts ({}) reached",
+                        max_attempts
+                    );
+                    eprintln!("   🔄 Will reset and continue trying...");
+                    eprintln!();
+                    // Wait a bit longer before starting over
+                    sleep(Duration::from_secs(30)).await;
                 }
             }
         }
@@ -4717,7 +4826,50 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
     println!("   ✅ Portal impl notifications (org.freedesktop.impl.portal.Notification)");
     println!("   ✅ GTK notifications (org.gtk.Notifications)");
     println!("   ✅ KDE notifications (org.kde.NotificationWatcher)");
-    println!("   → Fractal, Flatpak apps, GTK apps, and KDE apps now fully supported!\n");
+    println!("   ✅ Phone calls (ModemManager on system bus)");
+    println!(
+        "   → Fractal, Flatpak apps, GTK apps, KDE apps, and phone calls now fully supported!\n"
+    );
+
+    // Also connect to system bus for ModemManager (phone calls)
+    println!("📡 Connecting to system bus for phone call monitoring...");
+    let system_connection = match zbus::Connection::system().await {
+        Ok(conn) => {
+            println!("   ✅ System bus connected (ModemManager)");
+
+            // Add match rule to receive ModemManager signals
+            // This tells DBus to send us PropertiesChanged signals from ModemManager
+            match conn.call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "AddMatch",
+                &("type='signal',interface='org.freedesktop.DBus.Properties',path_namespace='/org/freedesktop/ModemManager1'"),
+            ).await {
+                Ok(_) => {
+                    println!("   ✅ Subscribed to ModemManager signals");
+                    println!("   ℹ️  Listening for incoming call notifications...");
+                }
+                Err(e) => {
+                    eprintln!("   ⚠️  Failed to subscribe to ModemManager signals: {}", e);
+                    eprintln!("   ℹ️  Phone call notifications may not work");
+                }
+            }
+
+            Some(conn)
+        }
+        Err(e) => {
+            eprintln!("   ⚠️  Failed to connect to system bus: {}", e);
+            eprintln!("   ℹ️  Phone call notifications (ModemManager) will not work");
+            None
+        }
+    };
+
+    let mut system_stream = if let Some(ref conn) = system_connection {
+        Some(zbus::MessageStream::from(conn))
+    } else {
+        None
+    };
 
     // Start listening for messages
     let mut stream = zbus::MessageStream::from(&connection);
@@ -4748,6 +4900,31 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                            (interface == "org.kde.NotificationWatcher" && member == "Notify") {
                             if let Err(e) = handle_dbus_notification(&msg, &handler_clone, &filter_apps, min_urgency, enable_dedup).await {
                                 eprintln!("⚠️  Error handling notification: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+            Some(msg) = async {
+                match &mut system_stream {
+                    Some(stream) => stream.next().await,
+                    None => None,
+                }
+            } => {
+                if let Ok(msg) = msg {
+                    if msg.message_type() == zbus::message::Type::Signal {
+                        let header = msg.header();
+                        let interface = header.interface().map(|i| i.as_str()).unwrap_or("<none>");
+                        let member = header.member().map(|m| m.as_str()).unwrap_or("<none>");
+                        let path = header.path().map(|p| p.as_str()).unwrap_or("<none>");
+
+                        // Handle ModemManager call signals
+                        if interface == "org.freedesktop.DBus.Properties"
+                            && member == "PropertiesChanged"
+                            && path.contains("ModemManager1/Modem") {
+
+                            if let Err(e) = handle_modemmanager_call(&msg, &handler_clone).await {
+                                eprintln!("⚠️  Error handling ModemManager call: {}", e);
                             }
                         }
                     }

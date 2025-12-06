@@ -329,20 +329,10 @@ impl MessageReceiver for MlrGfdiReceiver {
                 } else {
                     "unknown".to_string()
                 };
-                info!("🔔 Spawning async callback for message type {}", msg_type);
 
                 tokio::spawn(async move {
-                    info!(
-                        "🔔 Async callback task started for message type {}",
-                        msg_type
-                    );
                     match callback.on_message(&decoded_vec).await {
-                        Ok(_) => {
-                            info!(
-                                "✅ Async callback completed successfully for message type {}",
-                                msg_type
-                            );
-                        }
+                        Ok(_) => {}
                         Err(e) => {
                             error!(
                                 "❌ Async MLR callback error for message type {}: {}",
@@ -797,14 +787,10 @@ impl CommunicatorV2 {
             return Ok(());
         }
 
-        info!("📥 Data received from watch: {} bytes", data.len());
-        info!("   First bytes: {:02X?}", &data[..data.len().min(8)]);
         debug!("Characteristic changed: {} bytes", data.len());
         debug!("Raw data: {:02X?}", &data[..data.len().min(20)]);
 
-        debug!("on_characteristic_changed: attempting to acquire state lock");
         let mut state = self.state.lock().await;
-        debug!("on_characteristic_changed: acquired state lock");
 
         // Check if this is an MLR packet
         if data.len() >= 2 && (data[0] & 0x80) != 0 {

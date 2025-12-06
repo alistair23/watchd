@@ -8,6 +8,7 @@
 //! - Provides health metrics and diagnostics
 
 use bluer::Device;
+use log::debug;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -175,7 +176,7 @@ impl WatchdogManager {
         let mut state = self.state.lock().await;
         let now = Instant::now();
         state.last_rx = Some(now);
-        eprintln!("🟢 Watchdog: RX traffic recorded at {:?}", now);
+        debug!("🟢 Watchdog: RX traffic recorded at {:?}", now);
 
         // Update health status if we were degraded
         if state.health_status != HealthStatus::Healthy && !state.is_reconnecting {
@@ -270,10 +271,6 @@ impl WatchdogManager {
     /// Check if reconnection is needed (sync version for non-Tokio thread)
     /// Only checks internal watchdog state, not BLE connection state
     pub async fn check_reconnect_needed_sync(&self, ble: &Arc<Device>) -> Option<String> {
-        // Use try_lock to avoid blocking - if we can't get lock, skip this check
-
-        println!("watchdog: Checking if reconnect is required");
-
         // Extract needed data without holding the lock across await
         let (is_reconnecting, health_status, last_rx, rx_timeout) = {
             let state = match self.state.try_lock() {

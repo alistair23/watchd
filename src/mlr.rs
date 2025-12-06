@@ -269,7 +269,6 @@ impl MlrCommunicator {
             drop(state);
         }
 
-        info!("Running Protocol");
         // Run protocol multiple times to drain queue if window opened up
         for _ in 0..10 {
             match self.run_protocol().await {
@@ -597,6 +596,7 @@ impl MlrCommunicator {
                             packets.push((task_name, packet, i));
                         } else {
                             error!("Attempting to re-send null fragment at index {}", i);
+                            return Ok(());
                         }
                         i = (i + 1) % (MAX_SEQ_NUM + 1);
                     }
