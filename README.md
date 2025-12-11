@@ -15,7 +15,9 @@ The following key features are supported
      - Allow dismissing notifications on the watch
  - Proxy HTTP requests
      - Proxy HTTP requests from the watch to the internet and return the response
-     - Garmin Weather support, including Radar updates
+     - Garmin Weather support
+         - Radar updates are downloaded, but don't transfer correctly
+           to the watch, resulting in only partial coverage
  - ConnectIQHTTP support
      - Allow custom applications (like GarminHomeAssistant) to work on the watch
  - Calendar sync support
