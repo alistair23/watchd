@@ -22,11 +22,11 @@ use futures::stream::StreamExt;
 use garmin_v2_communicator::{
     encode_calendar_response, handle_calendar_request, handle_http_request, parse_calendar_request,
     AsyncGfdiMessageCallback, BleSupport, CalendarManager, CalendarResponseStatus,
-    CharacteristicHandle, CommunicatorV2, DataTransferHandler, HttpRequest, MessageGenerator,
-    MessageParser, Transaction, WatchdogConfig, WatchdogManager,
+    CharacteristicHandle, CommunicatorV2, DataTransferHandler, HealthStatus, HttpRequest,
+    MessageGenerator, MessageParser, Transaction, WatchdogConfig, WatchdogManager,
 };
+use log::{debug, error, info};
 use std::collections::{HashMap, VecDeque};
-
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -385,7 +385,7 @@ impl NotificationUpdateMessageBuilder {
 }
 
 pub struct GarminNotificationHandler {
-    communicator: Arc<CommunicatorV2>,
+    communicator: Arc<futures::lock::Mutex<Arc<CommunicatorV2>>>,
     active_notifications: Arc<Mutex<HashMap<i32, CallSpec>>>,
     notification_counts: Arc<Mutex<HashMap<NotificationType, u8>>>,
     stored_notifications: Arc<Mutex<HashMap<i32, NotificationSpec>>>,
@@ -403,7 +403,7 @@ pub struct GarminNotificationHandler {
 impl GarminNotificationHandler {
     pub fn new(communicator: Arc<CommunicatorV2>, watchdog: Arc<WatchdogManager>) -> Self {
         Self {
-            communicator,
+            communicator: Arc::new(futures::lock::Mutex::new(communicator)),
             active_notifications: Arc::new(Mutex::new(HashMap::new())),
             notification_counts: Arc::new(Mutex::new(HashMap::new())),
             stored_notifications: Arc::new(Mutex::new(HashMap::new())),
@@ -541,6 +541,8 @@ impl GarminNotificationHandler {
 
         let gfdi_message = self.wrap_in_gfdi_envelope(5033, &remove_msg);
         self.communicator
+            .lock()
+            .await
             .send_message("notification_remove", &gfdi_message)
             .await?;
 
@@ -691,6 +693,8 @@ impl GarminNotificationHandler {
             // Try to send - detect "Not connected" errors
             match self
                 .communicator
+                .lock()
+                .await
                 .send_message("notification", &gfdi_message)
                 .await
             {
@@ -736,6 +740,8 @@ impl GarminNotificationHandler {
         // Try to send - detect "Not connected" errors
         match self
             .communicator
+            .lock()
+            .await
             .send_message("notification", &gfdi_message)
             .await
         {
@@ -818,6 +824,10 @@ impl GarminNotificationHandler {
         Ok(())
     }
 
+    async fn set_communicator(&self, comm: Arc<CommunicatorV2>) {
+        *self.communicator.lock().await = comm;
+    }
+
     /// Mark handler as connected or disconnected
     pub fn set_connected(&self, connected: bool) {
         *self.is_connected.lock().unwrap() = connected;
@@ -861,6 +871,8 @@ impl GarminNotificationHandler {
 
             let response = self.wrap_in_gfdi_envelope(0x1388, &response_payload);
             self.communicator
+                .lock()
+                .await
                 .send_message("notification_action_ack", &response)
                 .await?;
 
@@ -910,6 +922,8 @@ impl GarminNotificationHandler {
                 let gfdi_message = self.wrap_in_gfdi_envelope(5033, &remove_msg);
                 if let Err(e) = self
                     .communicator
+                    .lock()
+                    .await
                     .send_message("notification_remove", &gfdi_message)
                     .await
                 {
@@ -935,6 +949,8 @@ impl GarminNotificationHandler {
 
             let response = self.wrap_in_gfdi_envelope(0x1388, &response_payload);
             self.communicator
+                .lock()
+                .await
                 .send_message("notification_action_ack", &response)
                 .await?;
 
@@ -1133,6 +1149,8 @@ impl GarminNotificationHandler {
                 // Try to send - detect "Not connected" errors
                 match self
                     .communicator
+                    .lock()
+                    .await
                     .send_message("notification_data", &data_msg)
                     .await
                 {
@@ -1198,6 +1216,8 @@ impl GarminNotificationHandler {
         // Try to send - detect "Not connected" errors
         match self
             .communicator
+            .lock()
+            .await
             .send_message("notification", &gfdi_message)
             .await
         {
@@ -1275,6 +1295,8 @@ impl GarminNotificationHandler {
                 // Try to send - detect "Not connected" errors
                 match self
                     .communicator
+                    .lock()
+                    .await
                     .send_message("notification", &gfdi_message)
                     .await
                 {
@@ -1316,6 +1338,8 @@ impl GarminNotificationHandler {
 
                 let gfdi_message = self.wrap_in_gfdi_envelope(5033, &remove_msg);
                 self.communicator
+                    .lock()
+                    .await
                     .send_message("call_end_notification", &gfdi_message)
                     .await?;
 
@@ -1378,6 +1402,7 @@ impl GarminNotificationHandler {
 struct BlueRSupport {
     device: Arc<Device>,
     characteristics: Arc<Mutex<HashMap<String, Characteristic>>>,
+    listener_shutdown: Arc<Mutex<Option<tokio::sync::mpsc::Sender<()>>>>,
 }
 
 impl BlueRSupport {
@@ -1412,6 +1437,7 @@ impl BlueRSupport {
         Ok(Self {
             device: Arc::new(device),
             characteristics: Arc::new(Mutex::new(HashMap::new())),
+            listener_shutdown: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1472,17 +1498,6 @@ impl BlueRSupport {
         Ok(())
     }
 
-    /// Rediscover characteristics (useful after reconnection)
-    async fn rediscover_characteristics(
-        &self,
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        // Clear old characteristics
-        self.characteristics.lock().unwrap().clear();
-
-        // Discover new ones
-        self.discover_services().await
-    }
-
     /// Start notification listener with real-time bidirectional communication
     async fn start_notification_listener(
         &self,
@@ -1490,70 +1505,88 @@ impl BlueRSupport {
         communicator: Arc<CommunicatorV2>,
         watchdog: Option<Arc<WatchdogManager>>,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let uuid_upper = uuid.to_uppercase();
+        // Create shutdown channel
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
 
-        let char = {
-            let characteristics = self.characteristics.lock().unwrap();
-            if let Some(characteristic) = characteristics.get(&uuid_upper) {
-                characteristic.clone()
-            } else {
-                return Err(format!("Characteristic {} not found", uuid).into());
-            }
-        };
-
+        // Store shutdown sender so we can stop the listener later
+        *self.listener_shutdown.lock().unwrap() = Some(shutdown_tx);
         println!(
             "📡 Starting real-time notification listener on {}",
             &uuid[..13]
         );
 
+        let mut uuid_copy = String::from("");
+        uuid_copy.push_str(uuid);
+        let characteristics = self.characteristics.lock().unwrap().clone();
+
         // Create a channel to signal when listener is ready
         let (ready_tx, mut ready_rx) = tokio::sync::mpsc::channel::<()>(1);
 
         tokio::spawn(async move {
-            match char.notify().await {
-                Ok(stream) => {
-                    println!(
-                        "   ✅ Notification stream active - bidirectional communication enabled"
-                    );
+            let uuid_upper = uuid_copy.to_uppercase();
 
-                    // Signal that we're ready
-                    let _ = ready_tx.send(()).await;
+            if let Some(characteristic) = characteristics.get(&uuid_upper) {
+                match characteristic.notify().await {
+                    Ok(stream) => {
+                        info!("   ✅ Notification stream active - bidirectional communication enabled");
 
-                    // Pin the stream to make it work with StreamExt
-                    let mut stream = Box::pin(stream);
+                        // Signal that we're ready
+                        let _ = ready_tx.send(()).await;
 
-                    while let Some(value) = stream.next().await {
-                        println!("📥 RAW DATA FROM WATCH:");
-                        println!("   Length: {} bytes", value.len());
-                        println!("   Hex: {}", hex_dump(&value, 32));
+                        // Pin the stream to make it work with StreamExt
+                        let mut stream = Box::pin(stream);
 
-                        // Record RX traffic for watchdog
-                        if let Some(ref wd) = watchdog {
-                            wd.record_rx().await;
+                        loop {
+                            tokio::select! {
+                                Some(value) = stream.next() => {
+                            debug!("📥 RAW DATA FROM WATCH:");
+                            debug!("   Length: {} bytes", value.len());
+                            debug!("   Hex: {}", hex_dump(&value, 32));
+
+                            // Record RX traffic for watchdog
+                            if let Some(ref wd) = watchdog {
+                                wd.record_rx().await;
+                            }
+
+                            // Process received data through communicator
+                                    if let Err(e) = communicator.on_characteristic_changed(&value).await {
+                                        error!("   ❌ Error processing notification: {}", e);
+                                    }
+                                }
+                                _ = shutdown_rx.recv() => {
+                                    info!("   🛑 Listener shutdown requested");
+                                    break;
+                                }
+                            }
                         }
 
-                        // Process received data through communicator
-                        if let Err(e) = communicator.on_characteristic_changed(&value).await {
-                            eprintln!("   ❌ Error processing notification: {}", e);
-                        }
+                        info!("   ⚠️  Notification stream ended");
                     }
-
-                    println!("   ⚠️  Notification stream ended");
+                    Err(e) => {
+                        error!("   ❌ Failed to start notification stream: {}", e);
+                    }
                 }
-                Err(e) => {
-                    eprintln!("   ❌ Failed to start notification stream: {}", e);
-                }
+            } else {
+                error!("Characteristic {} not found", uuid_upper);
             }
         });
 
         // Wait for the listener to be ready
         match tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx.recv()).await {
             Ok(Some(_)) => {
-                println!("   ✅ Listener confirmed active and ready");
+                info!("   ✅ Listener confirmed active and ready");
                 Ok(())
             }
             Ok(None) => Err("Listener channel closed unexpectedly".into()),
             Err(_) => Err("Timeout waiting for listener to become active".into()),
+        }
+    }
+
+    /// Stop the notification listener
+    fn stop_listener(&self) {
+        if let Some(tx) = self.listener_shutdown.lock().unwrap().take() {
+            let _ = tx.try_send(());
+            info!("   🛑 Sent shutdown signal to listener");
         }
     }
 }
@@ -1576,9 +1609,8 @@ impl BleSupport for BlueRSupport {
 
     fn enable_notifications(
         &self,
-        handle: &CharacteristicHandle,
+        _handle: &CharacteristicHandle,
     ) -> garmin_v2_communicator::Result<()> {
-        println!("📡 Enabling notifications for {}", &handle.uuid[..13]);
         // Notifications will be enabled asynchronously
         Ok(())
     }
@@ -1588,12 +1620,12 @@ impl BleSupport for BlueRSupport {
         handle: &CharacteristicHandle,
         data: &[u8],
     ) -> garmin_v2_communicator::Result<()> {
-        println!(
+        debug!(
             "📤 BLE WRITE: {} bytes to characteristic {}",
             data.len(),
             &handle.uuid[..20]
         );
-        println!("   Hex: {}", hex_dump(data, 64));
+        debug!("   Hex: {}", hex_dump(data, 64));
 
         let uuid_upper = handle.uuid.to_uppercase();
 
@@ -1605,16 +1637,16 @@ impl BleSupport for BlueRSupport {
 
         if let Some(characteristic) = characteristic {
             let _result = characteristic.write(&data).await.map_err(|e| {
-                eprintln!("   ❌ BLE write failed: {}", e);
+                error!("   ❌ BLE write failed: {}", e);
                 garmin_v2_communicator::GarminError::BluetoothError(format!(
                     "Failed to write: {}",
                     e
                 ))
             })?;
-            println!("   ✅ BLE write completed successfully");
+            debug!("   ✅ BLE write completed successfully");
             Ok(())
         } else {
-            eprintln!("   ❌ Characteristic {} not found", handle.uuid);
+            error!("   ❌ Characteristic {} not found", handle.uuid);
             Err(garmin_v2_communicator::GarminError::BluetoothError(
                 format!("Characteristic {} not found", handle.uuid),
             ))
@@ -1711,11 +1743,6 @@ impl AsyncMessageHandler {
                     // Acquire semaphore to ensure only one message is being sent at a time
                     let _permit = sem.acquire().await.unwrap();
 
-                    println!(
-                        "   📤 [QUEUE] Processing message from queue ({} bytes)",
-                        msg.len()
-                    );
-
                     // Get communicator and send
                     let comm_ref = {
                         let c = comm.lock().unwrap();
@@ -1726,7 +1753,7 @@ impl AsyncMessageHandler {
                         match communicator.send_message("queued_message", &msg).await {
                             Ok(()) => {}
                             Err(e) => {
-                                eprintln!("   ❌ [QUEUE] Failed to send message: {}", e);
+                                error!("   ❌ [QUEUE] Failed to send message: {}", e);
                             }
                         }
                     }
@@ -1785,27 +1812,19 @@ impl AsyncMessageHandler {
         }
 
         let request_id = u16::from_le_bytes([message[4], message[5]]);
-        let _data_offset = u32::from_le_bytes([message[6], message[7], message[8], message[9]]);
-        let total_length = u32::from_le_bytes([message[10], message[11], message[12], message[13]]);
-        let _data_length = u32::from_le_bytes([message[14], message[15], message[16], message[17]]);
 
         // Extract protobuf payload (starts at byte 18, ends at -2 for checksum)
         let protobuf_payload = message[18..message.len() - 2].to_vec();
 
-        println!("   📦 Checking protobuf message size:");
-        println!("      Total protobuf length: {} bytes", total_length);
-        println!("      Current chunk size: {} bytes", _data_length);
-        println!("      Max chunk size: {} bytes", MAX_PROTOBUF_CHUNK_SIZE);
-
         // Check if we need to chunk
         if protobuf_payload.len() <= MAX_PROTOBUF_CHUNK_SIZE {
             // Small enough to send as-is
-            println!("   ✅ Message fits in one chunk, sending directly");
+            info!("   ✅ Message fits in one chunk, sending directly");
             return self.send_response(&message).await;
         }
 
         // Need to chunk - store the complete payload and send first chunk
-        println!(
+        info!(
             "   📦 Message too large, chunking into {}-byte chunks",
             MAX_PROTOBUF_CHUNK_SIZE
         );
@@ -1822,11 +1841,17 @@ impl AsyncMessageHandler {
                     request_id,
                 },
             );
-            println!("   📦 Stored pending chunk for request ID {}", request_id);
+            info!("   📦 Stored pending chunk for request ID {}", request_id);
         }
 
         // Build first chunk
         let first_chunk = &protobuf_payload[..MAX_PROTOBUF_CHUNK_SIZE];
+        println!("   📦 First chunk details:");
+        println!("      Start offset: 0");
+        println!("      End offset: {}", MAX_PROTOBUF_CHUNK_SIZE);
+        println!("      Chunk size: {} bytes", first_chunk.len());
+        println!("      First 32 bytes: {}", hex_dump(first_chunk, 32));
+
         self.send_protobuf_chunk(request_id, 0, first_chunk, protobuf_payload.len())
             .await
     }
@@ -1844,6 +1869,16 @@ impl AsyncMessageHandler {
         println!("      Offset: {}", data_offset);
         println!("      Chunk size: {} bytes", chunk_data.len());
         println!("      Total size: {} bytes", total_length);
+        println!(
+            "      Progress: {}/{} bytes ({:.1}%)",
+            data_offset + chunk_data.len() as u32,
+            total_length,
+            ((data_offset + chunk_data.len() as u32) as f64 / total_length as f64) * 100.0
+        );
+        println!(
+            "      Chunk data (first 32 bytes): {}",
+            hex_dump(chunk_data, 32)
+        );
 
         // Build ProtobufResponse message with this chunk
         let mut message = Vec::new();
@@ -1898,20 +1933,50 @@ impl AsyncMessageHandler {
             let next_offset = data_offset as usize + MAX_PROTOBUF_CHUNK_SIZE;
 
             println!("   📦 Checking for next chunk:");
-            println!("      Current offset after ACK: {}", data_offset);
-            println!("      Next offset: {}", next_offset);
+            println!("      Request ID: {}", request_id);
+            println!("      Current offset (from ACK): {}", data_offset);
+            println!("      Chunk size sent: {} bytes", MAX_PROTOBUF_CHUNK_SIZE);
+            println!(
+                "      Next offset calculation: {} + {} = {}",
+                data_offset, MAX_PROTOBUF_CHUNK_SIZE, next_offset
+            );
             println!("      Total length: {}", chunk_info.total_length);
+            println!(
+                "      Remaining: {} bytes",
+                chunk_info.total_length.saturating_sub(next_offset)
+            );
 
             if next_offset < chunk_info.total_length {
                 // More chunks to send
                 let remaining = chunk_info.total_length - next_offset;
                 let chunk_size = remaining.min(MAX_PROTOBUF_CHUNK_SIZE);
+
+                // Verify we're not reading beyond bounds
+                if next_offset + chunk_size > chunk_info.complete_payload.len() {
+                    eprintln!(
+                        "   ❌ ERROR: Chunk boundary exceeds payload! offset={}, size={}, total={}",
+                        next_offset,
+                        chunk_size,
+                        chunk_info.complete_payload.len()
+                    );
+                    return Ok(());
+                }
+
                 let next_chunk =
                     &chunk_info.complete_payload[next_offset..next_offset + chunk_size];
 
                 println!(
                     "   📤 Sending next chunk (offset {}, {} bytes)",
                     next_offset, chunk_size
+                );
+                println!(
+                    "      Extracting bytes: {}..{}",
+                    next_offset,
+                    next_offset + chunk_size
+                );
+                println!(
+                    "      First 32 bytes of chunk: {}",
+                    hex_dump(next_chunk, 32)
                 );
 
                 self.send_protobuf_chunk(
@@ -1924,8 +1989,11 @@ impl AsyncMessageHandler {
             } else {
                 // All chunks sent, remove from pending
                 println!("   ✅ All chunks sent for request ID {}", request_id);
+                println!("      Final offset: {}", next_offset);
+                println!("      Total transferred: {} bytes", chunk_info.total_length);
                 let mut pending = self.pending_protobuf_chunks.lock().unwrap();
                 pending.remove(&request_id);
+                println!("   🎉 Transfer complete! Removed from pending chunks.");
             }
         } else {
             println!(
@@ -1938,15 +2006,8 @@ impl AsyncMessageHandler {
     }
 
     async fn send_response(&self, response: &[u8]) -> garmin_v2_communicator::Result<()> {
-        println!("   📤 QUEUING MESSAGE:");
-        println!("      Message (with envelope): {}", hex_dump(response, 32));
-
-        // Add message to queue instead of sending directly
-        {
-            let mut queue = self.message_queue.lock().unwrap();
-            queue.push_back(response.to_vec());
-            println!("   ✅ Message added to queue (queue size: {})", queue.len());
-        }
+        let mut queue = self.message_queue.lock().unwrap();
+        queue.push_back(response.to_vec());
 
         Ok(())
     }
@@ -2391,8 +2452,19 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                                         u32::from_le_bytes([data[5], data[6], data[7], data[8]]);
 
                                     println!("   📨 ACK for ProtobufResponse chunk");
+                                    println!("      Original msg ID: 0x{:04X}", original_msg_id);
+                                    println!(
+                                        "      Status: {} ({})",
+                                        status,
+                                        if status == 0 { "ACK" } else { "NACK" }
+                                    );
                                     println!("      Request ID: {}", request_id);
-                                    println!("      Data offset: {}", data_offset);
+                                    println!("      Data offset (from ACK): {}", data_offset);
+                                    println!("      ACK data length: {} bytes", data.len());
+                                    println!(
+                                        "      ACK data (hex): {}",
+                                        hex_dump(&data, data.len())
+                                    );
 
                                     // Handle the chunk ACK (send next chunk if needed)
                                     if let Err(e) = self
@@ -2655,7 +2727,7 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                                                             "      🔄 Fetching calendar events..."
                                                         );
                                                         let fetch_result = tokio::time::timeout(
-                                                            Duration::from_secs(5),
+                                                            Duration::from_secs(15),
                                                             handle_calendar_request(
                                                                 &calendar_request,
                                                                 calendar_mgr_opt,
@@ -3788,21 +3860,10 @@ async fn handle_modemmanager_call(
         Vec<String>,
     ) = msg.body().deserialize()?;
 
-    println!(
-        "🔍 ModemManager PropertiesChanged: interface={}",
-        interface_name
-    );
-
     // Check if this is a Voice interface change
     if interface_name != "org.freedesktop.ModemManager1.Modem.Voice" {
         return Ok(());
     }
-
-    println!("   ℹ️  Voice interface properties changed");
-    println!(
-        "   Properties: {:?}",
-        changed_properties.keys().collect::<Vec<_>>()
-    );
 
     // Check if Calls array changed
     if let Some(calls_value) = changed_properties.get("Calls") {
@@ -4058,7 +4119,9 @@ fn map_app_to_notification_type(
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .filter_module("zbus::connection::socket_reader", log::LevelFilter::Warn)
+        .init();
 
     // console_subscriber::init();
 
@@ -4130,13 +4193,186 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Connection result containing all components needed for watch communication
+struct WatchConnection {
+    ble_support: Arc<BlueRSupport>,
+    communicator: Arc<CommunicatorV2>,
+}
+
+/// Connect to the watch and set up all communication channels
+async fn connect_to_watch(
+    adapter: &Adapter,
+    mac_address: &str,
+    watchdog: Arc<WatchdogManager>,
+    skip_pairing: bool,
+    async_handler: &Arc<AsyncMessageHandler>,
+) -> std::result::Result<WatchConnection, Box<dyn std::error::Error>> {
+    println!("\n🔌 Connecting to watch {}...", mac_address);
+
+    // Connect to device
+    let ble_support = match BlueRSupport::new(adapter, mac_address).await {
+        Ok(support) => support,
+        Err(e) => {
+            println!("   ❌ Failed to connect: {}", e);
+            return Err(e);
+        }
+    };
+    println!("   ✅ Connected to device");
+
+    let ble_arc = Arc::new(ble_support);
+
+    // Wait for connection to stabilize
+    println!("   ⏳ Waiting for connection to stabilize...");
+    sleep(Duration::from_secs(3)).await;
+
+    // Discover characteristics
+    println!("\n🔍 Discovering services and characteristics...");
+    if let Err(e) = ble_arc.discover_services().await {
+        println!("   ❌ Failed to discover services: {}", e);
+        return Err(e);
+    }
+
+    // Create communicator
+    println!("\n3️⃣  Creating communicator...");
+    let mut communicator = CommunicatorV2::new(ble_arc.clone());
+    println!("   ✅ Communicator created");
+
+    // Set up async message handler BEFORE initialization
+    communicator.set_async_message_callback(async_handler.clone());
+
+    // Find characteristics
+    println!("\n4️⃣  Finding Garmin ML characteristics...");
+    let init_result = match communicator.initialize_device().await {
+        Ok(true) => {
+            println!("   ✅ Characteristics found and set up!");
+            true
+        }
+        Ok(false) => {
+            println!("   ❌ Failed to find Garmin ML characteristics");
+            return Err(Box::new(std::io::Error::other(
+                "Failed to find characteristics",
+            )));
+        }
+        Err(e) => {
+            println!("   ❌ Initialization error: {}", e);
+            return Err(Box::new(e));
+        }
+    };
+
+    if !init_result {
+        return Err(Box::new(std::io::Error::other("Initialization failed")));
+    }
+
+    // Create Arc for communicator
+    let communicator = Arc::new(communicator);
+
+    // Set communicator reference in async handler
+    async_handler.set_communicator(communicator.clone());
+
+    // Start notification listener
+    println!("\n5️⃣  Starting notification listener...");
+    let receive_uuid = communicator.get_receive_characteristic_uuid().await;
+
+    if let Some(uuid) = receive_uuid {
+        println!("   Using receive characteristic: {}", &uuid[..20]);
+        match ble_arc
+            .start_notification_listener(&uuid, communicator.clone(), Some(watchdog.clone()))
+            .await
+        {
+            Ok(_) => {
+                println!("   ✅ Listener is active and ready to receive responses");
+            }
+            Err(e) => {
+                println!("   ❌ Failed to start listener: {}", e);
+                return Err(e);
+            }
+        }
+    } else {
+        println!("   ❌ No receive characteristic found");
+        return Err(Box::new(std::io::Error::other(
+            "No receive characteristic found",
+        )));
+    }
+
+    // Small delay to ensure listener is fully settled
+    sleep(Duration::from_millis(200)).await;
+
+    // Send initialization requests
+    println!("\n6️⃣  Sending initialization requests...");
+    match communicator.initialize_device().await {
+        Ok(true) => {
+            println!("   ✅ CLOSE_ALL_REQ sent");
+            println!("   ℹ️  Waiting for watch responses...");
+        }
+        Ok(false) => {
+            println!("   ⚠️  Re-initialization returned false");
+        }
+        Err(e) => {
+            println!("   ❌ Initialization error: {}", e);
+            return Err(Box::new(e));
+        }
+    }
+
+    // Wait for MLR registration to complete
+    sleep(Duration::from_secs(3)).await;
+    println!("   ✅ MLR registration should be complete");
+
+    // Handle pairing if needed
+    if !skip_pairing {
+        println!("\n7️⃣  Waiting for pairing sequence...");
+        println!("   ℹ️  Watch will send configuration messages");
+        println!("\n   ⏳ Monitoring for Configuration message...");
+
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(8);
+        let mut config_received = false;
+        let mut last_check = start;
+
+        while start.elapsed() < timeout {
+            if async_handler.is_paired() {
+                config_received = true;
+                println!("   ✅ Configuration received - pairing complete!");
+                println!(
+                    "   ⏱️  Took {:.1}s to detect",
+                    start.elapsed().as_secs_f32()
+                );
+                break;
+            }
+
+            if last_check.elapsed() >= Duration::from_secs(1) {
+                println!(
+                    "   ⏳ Still waiting... ({:.0}s elapsed)",
+                    start.elapsed().as_secs_f32()
+                );
+                last_check = std::time::Instant::now();
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        if !config_received {
+            println!("   ⚠️  Configuration not received within timeout");
+            println!("   ℹ️  Continuing anyway - device may already be paired");
+        }
+    } else {
+        println!("\n7️⃣  Skip pairing flag set - going straight to notifications");
+    }
+
+    println!("\n✅ Watch connection fully established!\n");
+
+    Ok(WatchConnection {
+        ble_support: ble_arc,
+        communicator,
+    })
+}
+
 async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Create watchdog FIRST - before connection
     println!("🛡️  Creating connection watchdog...");
     let mut watchdog_config = WatchdogConfig::default();
-    watchdog_config.rx_timeout = Duration::from_secs(300); // 300 second timeout
+    watchdog_config.rx_timeout = Duration::from_secs(60 * 60); // one hour timeout
     let watchdog = Arc::new(WatchdogManager::with_config(watchdog_config));
-    println!("   ✅ Watchdog configured (300 second timeout)");
+    println!("   ✅ Watchdog configured (one hour timeout)");
 
     // Initialize Bluetooth
     println!("\n1️⃣  Initializing Bluetooth...");
@@ -4152,40 +4388,40 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
     let adapter = match session.default_adapter().await {
         Ok(a) => a,
         Err(e) => {
-            println!("   ❌ Failed to get Bluetooth adapter: {}", e);
+            error!("   ❌ Failed to get Bluetooth adapter: {}", e);
             return Err(Box::new(std::io::Error::other(
                 "Failed to get Bluetooth adapter",
             )));
         }
     };
     let adapter_name = adapter.name();
-    println!("   Using adapter: {}", adapter_name);
+    debug!("   Using adapter: {}", adapter_name);
 
     // Ensure Bluetooth adapter is powered on
     match adapter.is_powered().await {
         Ok(true) => {
-            println!("   ✅ Bluetooth adapter is powered on");
+            debug!("   ✅ Bluetooth adapter is powered on");
         }
         Ok(false) => {
-            println!("   ⚠️  Bluetooth adapter is off, attempting to turn it on...");
+            debug!("   ⚠️  Bluetooth adapter is off, attempting to turn it on...");
 
             // First try: Use rfkill to unblock Bluetooth
-            println!("   🔧 Attempting: rfkill unblock bluetooth");
+            debug!("   🔧 Attempting: rfkill unblock bluetooth");
             match std::process::Command::new("rfkill")
                 .args(&["unblock", "bluetooth"])
                 .output()
             {
                 Ok(output) => {
                     if output.status.success() {
-                        println!("   ✅ rfkill unblock bluetooth succeeded");
-                        sleep(Duration::from_millis(500)).await;
+                        info!("   ✅ rfkill unblock bluetooth succeeded");
+                        sleep(Duration::from_secs(5)).await;
                     } else {
                         let stderr = String::from_utf8_lossy(&output.stderr);
-                        println!("   ⚠️  rfkill command failed: {}", stderr);
+                        error!("   ⚠️  rfkill command failed: {}", stderr);
                     }
                 }
                 Err(e) => {
-                    println!("   ⚠️  Could not run rfkill: {}", e);
+                    error!("   ⚠️  Could not run rfkill: {}", e);
                 }
             }
 
@@ -4194,29 +4430,10 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                 Ok(_) => {
                     // Wait a moment for adapter to fully power on
                     sleep(Duration::from_secs(2)).await;
-                    println!("   ✅ Bluetooth adapter powered on");
+                    info!("   ✅ Bluetooth adapter powered on");
                 }
                 Err(e) => {
-                    println!("   ❌ Failed to power on Bluetooth adapter: {}", e);
-                    println!();
-                    println!("   ⚠️  Automatic Bluetooth enabling failed.");
-                    println!("   Please turn on Bluetooth manually using ONE of these methods:");
-                    println!();
-                    println!("   Option 1 - Using bluetoothctl:");
-                    println!("      bluetoothctl power on");
-                    println!();
-                    println!("   Option 2 - Using rfkill with sudo:");
-                    println!("      sudo rfkill unblock bluetooth");
-                    println!();
-                    println!("   Option 3 - Using system settings:");
-                    println!("      Enable Bluetooth in your desktop environment's settings");
-                    println!();
-                    println!("   Option 4 - Run this application with elevated privileges:");
-                    println!(
-                        "      sudo -E cargo run --example notification_dbus_monitor -- {}",
-                        args.mac_address
-                    );
-                    println!();
+                    error!("   ❌ Failed to power on Bluetooth adapter: {}", e);
                     return Err(Box::new(std::io::Error::other(
                         "Bluetooth adapter is off and could not be powered on automatically",
                     )));
@@ -4224,17 +4441,17 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
             }
         }
         Err(e) => {
-            println!("   ⚠️  Could not check Bluetooth power state: {}", e);
-            println!("   Continuing anyway - if connection fails, ensure Bluetooth is enabled");
+            info!("   ⚠️  Could not check Bluetooth power state: {}", e);
+            info!("   Continuing anyway - if connection fails, ensure Bluetooth is enabled");
         }
     }
 
     // Connect to device
-    println!("\n2️⃣  Connecting to Garmin device...");
+    info!("\n2️⃣  Connecting to Garmin device...");
     let ble_support = match BlueRSupport::new(&adapter, &args.mac_address).await {
         Ok(support) => support,
         Err(e) => {
-            println!("   ❌ Failed to connect: {}", e);
+            error!("   ❌ Failed to connect: {}", e);
             return Err(Box::new(std::io::Error::other("Failed to connect")));
         }
     };
@@ -4344,148 +4561,22 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
         }
     }
 
-    // First, just find and set up the characteristics (don't send requests yet)
-    println!("\n5️⃣  Finding Garmin ML characteristics...");
-    let init_result = match communicator.initialize_device().await {
-        Ok(true) => {
-            println!("   ✅ Characteristics found and set up!");
-            true
-        }
-        Ok(false) => {
-            println!("   ❌ Failed to find Garmin ML characteristics");
-            println!("   Make sure the device is a Garmin watch with v2 protocol support");
-            return Ok(());
-        }
-        Err(e) => {
-            println!("   ❌ Initialization error: {}", e);
-            return Err(Box::new(std::io::Error::other("Initialization error")));
-        }
-    };
+    // Connect to watch
+    println!("\n2️⃣  Connecting to watch...");
+    let connection = connect_to_watch(
+        &adapter,
+        &args.mac_address,
+        watchdog.clone(),
+        args.skip_pairing,
+        &async_handler,
+    )
+    .await?;
 
-    if !init_result {
-        return Ok(());
-    }
+    let mut ble_arc = connection.ble_support;
+    let mut communicator = connection.communicator;
 
-    // Create Arc for communicator
-    let communicator = Arc::new(communicator);
-
-    // Set communicator reference in async handler
-    async_handler.set_communicator(communicator.clone());
-
-    // NOW start the notification listener - characteristics are set up
-    // CRITICAL: Must be active BEFORE we re-send requests
-    println!("\n6️⃣  Starting notification listener...");
-    let receive_uuid = communicator.get_receive_characteristic_uuid().await;
-
-    if let Some(uuid) = receive_uuid {
-        println!("   Using receive characteristic: {}", &uuid[..20]);
-        match ble_arc
-            .start_notification_listener(&uuid, communicator.clone(), Some(watchdog.clone()))
-            .await
-        {
-            Ok(_) => {
-                println!("   ✅ Listener is active and ready to receive responses");
-            }
-            Err(e) => {
-                println!("   ❌ Failed to start listener: {}", e);
-                println!("   ❌ Cannot proceed without active listener");
-                return Err(Box::new(std::io::Error::other("Failed to start listener")));
-            }
-        }
-    } else {
-        println!("   ❌ No receive characteristic found");
-        return Err(Box::new(std::io::Error::other(
-            "No receive characteristic found",
-        )));
-    }
-
-    // Small delay to ensure listener is fully settled
-    sleep(Duration::from_millis(200)).await;
-
-    // NOW re-initialize to send requests - listener will catch responses!
-    println!("\n7️⃣  Re-initializing to send requests (listener is ready)...");
-    match communicator.initialize_device().await {
-        Ok(true) => {
-            println!("   ✅ CLOSE_ALL_REQ sent");
-            println!("   ✅ REGISTER_ML_REQ sent");
-            println!("   ℹ️  Waiting for watch responses...");
-        }
-        Ok(false) => {
-            println!("   ⚠️  Re-initialization returned false (unexpected)");
-        }
-        Err(e) => {
-            println!("   ❌ Re-initialization error: {}", e);
-            return Err(Box::new(std::io::Error::other("Re-initialization error")));
-        }
-    }
-
-    // Wait for MLR registration to complete
-    // The watch will send CLOSE_ALL_RESP and REGISTER_ML_RESP
-    // The listener will process them
-    sleep(Duration::from_secs(3)).await;
-    println!("   ✅ MLR registration should be complete");
-
-    // Check if we should skip pairing
-    if args.skip_pairing {
-        println!("\n8️⃣  Skip pairing flag set - going straight to notifications");
-        println!("   ℹ️  Note: Device must already be paired for this to work");
-        // Just wait a moment for any pending messages
-        sleep(Duration::from_secs(1)).await;
-    } else {
-        // Wait for pairing sequence
-        println!("\n8️⃣  Waiting for pairing sequence...");
-        println!("   ℹ️  Watch will send:");
-        println!("      1. DeviceInformation - we'll respond");
-        println!("      2. Configuration - we'll respond + send init messages");
-        println!("      3. Other messages as needed");
-        println!("\n   ⏳ Monitoring for Configuration message...");
-
-        // Wait up to 8 seconds for pairing to complete
-        let start = std::time::Instant::now();
-        let timeout = Duration::from_secs(8);
-        let mut config_received = false;
-        let mut last_check = start;
-
-        while start.elapsed() < timeout {
-            if async_handler.is_paired() {
-                config_received = true;
-                println!("   ✅ Configuration received - pairing complete!");
-                println!(
-                    "   ⏱️  Took {:.1}s to detect",
-                    start.elapsed().as_secs_f32()
-                );
-                break;
-            }
-
-            // Log every second
-            if last_check.elapsed() >= Duration::from_secs(1) {
-                println!(
-                    "   ⏳ Still waiting... ({:.0}s elapsed)",
-                    start.elapsed().as_secs_f32()
-                );
-                last_check = std::time::Instant::now();
-            }
-
-            sleep(Duration::from_millis(100)).await;
-        }
-
-        if !config_received {
-            println!("   ⚠️  Configuration not received within timeout");
-            println!("   ℹ️  Continuing anyway - device may already be paired");
-        }
-
-        // Give a moment for initialization messages to be sent
-        // Skip this for reconnects to already-paired watches
-        if !args.skip_pairing {
-            sleep(Duration::from_secs(5)).await;
-        } else {
-            println!("   ℹ️  Skipping initialization sleep (already paired)");
-            sleep(Duration::from_secs(2)).await;
-        }
-    }
-
-    // Create notification handler WITH watchdog
-    println!("\n9️⃣  Creating notification handler...");
+    // Create notification handler
+    println!("\n8️⃣  Creating notification handler...");
     let handler = Arc::new(GarminNotificationHandler::new(
         communicator.clone(),
         watchdog.clone(),
@@ -4567,241 +4658,8 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
         }
     }
 
-    // Spawn reconnection handler in main Tokio runtime
-    let watchdog_for_reconnect = watchdog.clone();
-    let ble_for_reconnect = ble_arc.clone();
-    let handler_for_reconnect = handler.clone();
-    let communicator_for_reconnect = communicator.clone();
-    let mac_address_for_reconnect = args.mac_address.clone();
-    let adapter_for_reconnect = adapter.clone();
-
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(15)).await;
-
-            let reason = watchdog_for_reconnect
-                .check_reconnect_needed_sync(&ble_for_reconnect.device)
-                .await;
-
-            if let Some(reason) = reason {
-                eprintln!(
-                "   📡 Will attempt reconnection due to {reason} while continuing to monitor notifications..."
-            );
-
-                // Mark watchdog as reconnecting to prevent duplicate attempts
-                watchdog_for_reconnect.start_reconnecting().await;
-
-                // Mark handler as disconnected
-                handler_for_reconnect.set_connected(false);
-
-                // Immediately pause MLR to prevent any sends during reconnection
-                eprintln!("   ⏸️  Pausing MLR to stop all sends during reconnection...");
-                communicator_for_reconnect.clear_and_pause_mlr().await;
-
-                // Clean disconnect
-                if let Ok(true) = ble_for_reconnect.device.is_connected().await {
-                    if let Err(e) = ble_for_reconnect.device.disconnect().await {
-                        eprintln!("   ⚠️  Disconnect error: {}", e);
-                    } else {
-                        eprintln!("   ✅ Disconnected cleanly");
-                    }
-                }
-
-                watchdog_for_reconnect.mark_disconnected().await;
-
-                // Attempt reconnection
-                eprintln!(
-                    "\n🔄 Attempting to reconnect to watch {}...",
-                    mac_address_for_reconnect
-                );
-
-                let mut reconnect_attempts = 0;
-                let max_attempts = 10;
-
-                while reconnect_attempts < max_attempts {
-                    reconnect_attempts += 1;
-                    eprintln!(
-                        "   🔄 Reconnection attempt {}/{}...",
-                        reconnect_attempts, max_attempts
-                    );
-
-                    // Ensure Bluetooth adapter is powered on before attempting reconnection
-                    match adapter_for_reconnect.is_powered().await {
-                        Ok(true) => {
-                            // Adapter is on, good to proceed
-                        }
-                        Ok(false) => {
-                            eprintln!("   ⚠️  Bluetooth adapter is off, attempting to enable...");
-
-                            // Try rfkill unblock
-                            eprintln!("   🔧 Running: rfkill unblock bluetooth");
-                            match std::process::Command::new("rfkill")
-                                .args(&["unblock", "bluetooth"])
-                                .output()
-                            {
-                                Ok(output) => {
-                                    if output.status.success() {
-                                        eprintln!("   ✅ rfkill succeeded, waiting for adapter...");
-                                        sleep(Duration::from_millis(500)).await;
-
-                                        // Try to power on via adapter API
-                                        if let Ok(_) = adapter_for_reconnect.set_powered(true).await
-                                        {
-                                            sleep(Duration::from_secs(1)).await;
-                                            eprintln!("   ✅ Bluetooth adapter powered on");
-                                        }
-                                    } else {
-                                        eprintln!("   ⚠️  rfkill failed, skipping this attempt");
-                                        sleep(Duration::from_secs(10)).await;
-                                        continue;
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("   ⚠️  Could not run rfkill: {}", e);
-                                    eprintln!("   💡 Please enable Bluetooth manually");
-                                    sleep(Duration::from_secs(10)).await;
-                                    continue;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("   ⚠️  Could not check Bluetooth power: {}", e);
-                            // Continue anyway, might still work
-                        }
-                    }
-
-                    // Wait before attempting
-                    let backoff = Duration::from_secs(5 * reconnect_attempts.min(6));
-                    sleep(backoff).await;
-
-                    // Try to connect
-                    match ble_for_reconnect.device.connect().await {
-                        Ok(_) => {
-                            eprintln!("   ✅ BLE connected!");
-
-                            // Wait for BLE connection to fully stabilize
-                            // The watch needs time to be ready after reconnection
-                            eprintln!("   ⏳ Waiting for connection to stabilize...");
-                            sleep(Duration::from_secs(3)).await;
-
-                            // Re-discover characteristics after reconnection
-                            eprintln!("   🔍 Re-discovering characteristics...");
-                            if let Err(e) = ble_for_reconnect.rediscover_characteristics().await {
-                                eprintln!("   ❌ Failed to discover characteristics: {}", e);
-                                continue;
-                            }
-                            eprintln!("   ✅ Characteristics re-discovered");
-
-                            // Find the receive characteristic UUID manually without sending CLOSE_ALL_REQ
-                            eprintln!("   🔍 Finding Garmin ML receive characteristic...");
-                            let mut receive_uuid: Option<String> = None;
-                            for i in 0x2810..=0x2814 {
-                                let test_uuid =
-                                    format!("6A4E{:04X}-667B-11E3-949A-0800200C9A66", i);
-                                if ble_for_reconnect.get_characteristic(&test_uuid).is_some() {
-                                    receive_uuid = Some(test_uuid);
-                                    eprintln!(
-                                        "   ✅ Found characteristic: {}...",
-                                        &receive_uuid.as_ref().unwrap()[..20]
-                                    );
-                                    break;
-                                }
-                            }
-
-                            let receive_uuid = match receive_uuid {
-                                Some(uuid) => uuid,
-                                None => {
-                                    eprintln!("   ❌ No Garmin ML characteristic found");
-                                    continue;
-                                }
-                            };
-
-                            // RESTART notification listener FIRST - before sending any requests!
-                            eprintln!("   📡 Restarting notification listener...");
-
-                            match ble_for_reconnect
-                                .start_notification_listener(
-                                    &receive_uuid,
-                                    communicator_for_reconnect.clone(),
-                                    Some(watchdog_for_reconnect.clone()),
-                                )
-                                .await
-                            {
-                                Ok(_) => {
-                                    eprintln!("   ✅ Listener restarted successfully");
-                                }
-                                Err(e) => {
-                                    eprintln!("   ❌ Failed to restart listener: {}", e);
-                                    continue;
-                                }
-                            }
-
-                            // Give the listener time to fully activate
-                            eprintln!("   ⏳ Waiting for listener to stabilize...");
-                            sleep(Duration::from_secs(3)).await;
-
-                            // NOW initialize device and send CLOSE_ALL_REQ - listener is ready!
-                            eprintln!("\n7️⃣  Initializing device (listener is ready)...");
-                            eprintln!("   📤 This will send CLOSE_ALL_REQ to the watch");
-                            match communicator_for_reconnect.initialize_device().await {
-                                Ok(true) => {
-                                    eprintln!("   ✅ CLOSE_ALL_REQ sent");
-                                    eprintln!("   ℹ️  Waiting for CLOSE_ALL_RESP and service registration...");
-                                }
-                                Ok(false) => {
-                                    eprintln!("   ⚠️  Initialization failed");
-                                    continue;
-                                }
-                                Err(e) => {
-                                    eprintln!("   ❌ Initialization error: {}", e);
-                                    continue;
-                                }
-                            }
-
-                            sleep(Duration::from_secs(6)).await;
-
-                            // Resume MLR operations after successful reconnection
-                            eprintln!("   ▶️  Resuming MLR operations...");
-                            communicator_for_reconnect.resume_mlr().await;
-
-                            // Mark as connected
-                            watchdog_for_reconnect.mark_connected().await;
-                            handler_for_reconnect.set_connected(true);
-
-                            // Clear reconnecting flag
-                            watchdog_for_reconnect.finish_reconnecting().await;
-
-                            // Replay missed notifications
-                            if let Err(e) =
-                                handler_for_reconnect.replay_missed_notifications().await
-                            {
-                                eprintln!("   ⚠️  Error replaying notifications: {}", e);
-                            }
-
-                            eprintln!("   ✅ Reconnection complete! Resuming normal operation.\n");
-                            break;
-                        }
-                        Err(e) => {
-                            eprintln!("   ❌ Connection failed: {}", e);
-                        }
-                    }
-                }
-
-                if reconnect_attempts >= max_attempts {
-                    eprintln!(
-                        "   ⚠️  Max reconnection attempts ({}) reached",
-                        max_attempts
-                    );
-                    eprintln!("   🔄 Will reset and continue trying...");
-                    eprintln!();
-                    // Wait a bit longer before starting over
-                    sleep(Duration::from_secs(30)).await;
-                }
-            }
-        }
-    });
-
-    println!("   ✅ Reconnection handler active in main runtime");
+    // Variables for watchdog reconnection in main loop
+    let mut last_watchdog_check = std::time::Instant::now();
 
     println!("\n✨ Monitor ready! Listening for desktop notifications...");
     println!("   All notifications will be forwarded to your Garmin watch.");
@@ -4956,10 +4814,6 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                             Ok(events) => {
                                 println!("   ✅ Fetched {} calendar events", events.len());
 
-                                // TODO: Send calendar events to watch via protobuf
-                                // This requires implementing the CalendarService protobuf handler
-                                // similar to how notifications are sent
-
                                 if !events.is_empty() {
                                     println!("   📋 Upcoming events:");
                                     for (i, event) in events.iter().take(5).enumerate() {
@@ -4979,6 +4833,138 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                         }
 
                         last_calendar_sync = std::time::Instant::now();
+                    }
+                }
+            }
+
+            // Watchdog check every 15 seconds
+            _ = tokio::time::sleep(Duration::from_secs(15)) => {
+                if last_watchdog_check.elapsed() >= Duration::from_secs(15) {
+                    last_watchdog_check = std::time::Instant::now();
+
+                    if let Some(reason) = watchdog.check_reconnect_needed_sync(&ble_arc.device).await {
+                        eprintln!("   📡 Will attempt reconnection due to {reason}...");
+
+                        // Mark watchdog as reconnecting
+                        watchdog.start_reconnecting().await;
+                        handler.set_connected(false);
+
+                        // Cleanup old connection
+                        eprintln!("   ⏸️  Pausing and clearing MLR...");
+                        communicator.clear_and_pause_mlr().await;
+
+                        eprintln!("   🧹 Shutting down old communication tasks...");
+                        communicator.dispose().await;
+                        eprintln!("   ✅ Old tasks stopped");
+
+                        eprintln!("   🛑 Stopping old notification listener...");
+                        ble_arc.stop_listener();
+
+                        eprintln!("   🔌 Disconnecting old connection...");
+                        if let Ok(true) = ble_arc.device.is_connected().await {
+                            if let Err(e) = ble_arc.device.disconnect().await {
+                                eprintln!("   ⚠️  Disconnect error: {}", e);
+                            } else {
+                                eprintln!("   ✅ Disconnected cleanly");
+                            }
+                        }
+
+                        eprintln!("   ⏳ Waiting for old listener to terminate...");
+                        sleep(Duration::from_secs(2)).await;
+
+                        watchdog.mark_disconnected().await;
+
+                        // Attempt reconnection
+                        eprintln!("\n🔄 Attempting to reconnect to watch {}...", args.mac_address);
+
+                        let mut attempt = 0;
+
+                        'reconnect: loop {
+                            attempt += 1;
+                            eprintln!(
+                                "   🔄 Reconnection attempt {}...",
+                                attempt,
+                            );
+
+                            // Ensure Bluetooth is powered on
+                            match adapter.is_powered().await {
+                                Ok(false) => {
+                                    eprintln!("   ⚠️  Bluetooth adapter is off, enabling...");
+                                    eprintln!("   🔧 Running: rfkill unblock bluetooth");
+                                    if let Ok(output) = std::process::Command::new("rfkill")
+                                        .args(&["unblock", "bluetooth"])
+                                        .output()
+                                    {
+                                        if !output.status.success() {
+                                            eprintln!("   ⚠️  rfkill failed");
+                                        }
+                                    }
+                                    sleep(Duration::from_secs(5)).await;
+                                }
+                                Err(e) => {
+                                    eprintln!("   ⚠️  Could not check Bluetooth power: {}", e);
+                                }
+                                _ => {}
+                            }
+
+                            // Attempt connection
+                            let reconnect_success = {
+                                match connect_to_watch(
+                                    &adapter,
+                                    &args.mac_address,
+                                    watchdog.clone(),
+                                    args.skip_pairing,
+                                    &async_handler,
+                                )
+                                .await
+                                {
+                                    Ok(connection) => {
+                                        eprintln!("   ✅ Successfully reconnected!");
+
+                                        drop(ble_arc);
+                                        drop(communicator);
+
+                                        // Update all references
+                                        ble_arc = connection.ble_support.clone();
+                                        communicator = connection.communicator.clone();
+
+                                        handler.set_communicator(communicator.clone()).await;
+
+                                        Some(())
+                                    }
+                                    Err(_) => {
+                                        eprintln!("   ❌ Connection failed");
+                                        None
+                                    }
+                                }
+                            };
+
+                            if let Some(()) = reconnect_success {
+                                sleep(Duration::from_secs(4)).await;
+
+                                let health = watchdog.check_health().await;
+                                info!("Watchdog Health: {:?}", health);
+
+                                if health != HealthStatus::Healthy {
+                                    continue;
+                                }
+
+                                // Mark as connected
+                                watchdog.mark_connected().await;
+                                handler.set_connected(true);
+                                watchdog.finish_reconnecting().await;
+
+                                // Replay missed notifications
+                                if let Err(_) = handler.replay_missed_notifications().await {
+                                    error!("   ⚠️  Error replaying notifications");
+                                }
+
+                                info!("   ✅ Reconnection complete! Resuming normal operation.\n");
+                                break 'reconnect;
+                            } else {
+                                sleep(Duration::from_secs(40)).await;
+                            }
+                        }
                     }
                 }
             }

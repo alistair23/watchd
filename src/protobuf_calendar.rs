@@ -77,7 +77,7 @@
 //! The implementation uses manual protobuf encoding/decoding to avoid heavy dependencies.
 
 use crate::calendar::CalendarManager;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 
 /// Calendar service request from the watch
 /// Based on Garmin CalendarEventsRequest protobuf message
@@ -191,7 +191,6 @@ pub enum CalendarResponseStatus {
 /// - CalendarServiceRequest fields (begin, end, max_events, etc.)
 pub fn parse_calendar_request(data: &[u8]) -> Result<CalendarServiceRequest, String> {
     debug!("Parsing calendar request from {} bytes", data.len());
-    eprintln!("🔍 parse_calendar_request: START with {} bytes", data.len());
 
     let mut request = CalendarServiceRequest::default();
     let mut cursor = 0;
@@ -200,33 +199,22 @@ pub fn parse_calendar_request(data: &[u8]) -> Result<CalendarServiceRequest, Str
     // We need to find field 10 (CalendarService) or field 1 (CoreService with calendar)
     let mut calendar_service_data = None;
 
-    eprintln!("🔍 parse_calendar_request: Starting Smart message parse loop");
     let mut loop_count = 0;
     while cursor < data.len() {
         loop_count += 1;
         if loop_count > 100 {
-            eprintln!("🔍 parse_calendar_request: Loop guard - breaking after 100 iterations");
             break;
         }
-
-        eprintln!(
-            "🔍 parse_calendar_request: Loop iteration {}, cursor={}",
-            loop_count, cursor
-        );
 
         let old_cursor = cursor;
         if let Some((field_num, wire_type, field_data, next_cursor)) = parse_field(&data[cursor..])
         {
             debug!("Smart message field {}, wire type {}", field_num, wire_type);
-            eprintln!(
-                "🔍 parse_calendar_request: Found field {}, wire_type {}, next_cursor={}",
-                field_num, wire_type, next_cursor
-            );
 
             // Field 1 is CalendarService (according to Garmin protocol documentation)
             // Field 13 is CoreService
             if field_num == 1 {
-                eprintln!(
+                info!(
                     "🔍 parse_calendar_request: Found calendar/core service field {}",
                     field_num
                 );
@@ -238,16 +226,15 @@ pub fn parse_calendar_request(data: &[u8]) -> Result<CalendarServiceRequest, Str
 
             // Safety check: ensure cursor advances
             if cursor == old_cursor {
-                eprintln!("🔍 parse_calendar_request: Cursor not advancing, breaking");
+                error!("🔍 parse_calendar_request: Cursor not advancing, breaking");
                 break;
             }
         } else {
-            eprintln!("🔍 parse_calendar_request: parse_field returned None");
+            error!("🔍 parse_calendar_request: parse_field returned None");
             break;
         }
     }
 
-    eprintln!("🔍 parse_calendar_request: Finished Smart message parse loop");
     let calendar_data = calendar_service_data
         .ok_or_else(|| "No CalendarService or CoreService field found".to_string())?;
 
@@ -258,34 +245,23 @@ pub fn parse_calendar_request(data: &[u8]) -> Result<CalendarServiceRequest, Str
         "Found calendar service data: {} bytes (via field 1 = CalendarService)",
         calendar_data.len()
     );
-    eprintln!(
-        "🔍 parse_calendar_request: Found calendar_data with {} bytes",
-        calendar_data.len()
-    );
 
     // Now parse the CalendarService message
     // Field 1 = CalendarServiceRequest
     cursor = 0;
     let mut request_data = None;
 
-    eprintln!("🔍 parse_calendar_request: Starting CalendarService parse loop");
     let mut loop_count = 0;
     while cursor < calendar_data.len() {
         loop_count += 1;
         if loop_count > 100 {
-            eprintln!("🔍 parse_calendar_request: CalendarService loop guard - breaking");
             break;
         }
 
         let old_cursor = cursor;
-        if let Some((field_num, wire_type, field_data, next_cursor)) =
+        if let Some((field_num, _wire_type, field_data, next_cursor)) =
             parse_field(&calendar_data[cursor..])
         {
-            debug!(
-                "CalendarService field {}, wire type {}",
-                field_num, wire_type
-            );
-
             if field_num == 1 {
                 request_data = Some(field_data.to_vec());
                 break;
@@ -295,9 +271,7 @@ pub fn parse_calendar_request(data: &[u8]) -> Result<CalendarServiceRequest, Str
 
             // Safety check: ensure cursor advances
             if cursor == old_cursor {
-                eprintln!(
-                    "🔍 parse_calendar_request: CalendarService cursor not advancing, breaking"
-                );
+                error!("🔍 parse_calendar_request: CalendarService cursor not advancing, breaking");
                 break;
             }
         } else {
@@ -308,24 +282,19 @@ pub fn parse_calendar_request(data: &[u8]) -> Result<CalendarServiceRequest, Str
     let request_bytes =
         request_data.ok_or_else(|| "No CalendarServiceRequest field found".to_string())?;
 
-    debug!("Found calendar request data: {} bytes", request_bytes.len());
-
     // Parse the CalendarServiceRequest fields
     cursor = 0;
     let mut loop_count = 0;
     while cursor < request_bytes.len() {
         loop_count += 1;
         if loop_count > 100 {
-            eprintln!("🔍 parse_calendar_request: Request fields loop guard - breaking");
             break;
         }
 
         let old_cursor = cursor;
-        if let Some((field_num, wire_type, field_data, next_cursor)) =
+        if let Some((field_num, _wire_type, field_data, next_cursor)) =
             parse_field(&request_bytes[cursor..])
         {
-            debug!("Request field {}, wire type {}", field_num, wire_type);
-
             match field_num {
                 1 => {
                     // start_date (uint64)
@@ -437,9 +406,7 @@ pub fn parse_calendar_request(data: &[u8]) -> Result<CalendarServiceRequest, Str
 
             // Safety check: ensure cursor advances
             if cursor == old_cursor {
-                eprintln!(
-                    "🔍 parse_calendar_request: Request fields cursor not advancing, breaking"
-                );
+                error!("🔍 parse_calendar_request: Request fields cursor not advancing, breaking");
                 break;
             }
         } else {
@@ -453,7 +420,6 @@ pub fn parse_calendar_request(data: &[u8]) -> Result<CalendarServiceRequest, Str
         request.end_date,
         request.max_events
     );
-    eprintln!("🔍 parse_calendar_request: COMPLETE - returning request");
 
     Ok(request)
 }

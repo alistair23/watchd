@@ -8,7 +8,6 @@
 //! - Provides health metrics and diagnostics
 
 use bluer::Device;
-use log::debug;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -176,7 +175,7 @@ impl WatchdogManager {
         let mut state = self.state.lock().await;
         let now = Instant::now();
         state.last_rx = Some(now);
-        debug!("🟢 Watchdog: RX traffic recorded at {:?}", now);
+        eprintln!("🟢 Watchdog: RX traffic recorded at {:?}", now);
 
         // Update health status if we were degraded
         if state.health_status != HealthStatus::Healthy && !state.is_reconnecting {
@@ -235,24 +234,20 @@ impl WatchdogManager {
     }
 
     /// Check connection health and return status
-    pub async fn check_health(&self, is_connected: bool) -> HealthStatus {
+    pub async fn check_health(&self) -> HealthStatus {
         let mut state = self.state.lock().await;
         let now = Instant::now();
-
-        // If explicitly disconnected, mark as such
-        if !is_connected {
-            state.health_status = HealthStatus::Disconnected;
-            return HealthStatus::Disconnected;
-        }
-
-        // If reconnecting, keep that status
-        if state.is_reconnecting {
-            return HealthStatus::Reconnecting;
-        }
 
         // Check RX timeout
         if let Some(last_rx) = state.last_rx {
             let rx_elapsed = now.duration_since(last_rx);
+
+            // If reconnecting, keep that status
+            if state.is_reconnecting {
+                if rx_elapsed >= Duration::from_secs(10) {
+                    return HealthStatus::Reconnecting;
+                }
+            }
 
             if rx_elapsed >= self.config.rx_timeout {
                 state.health_status = HealthStatus::Unhealthy;
@@ -309,6 +304,12 @@ impl WatchdogManager {
             let elapsed = now.duration_since(last_rx);
             if elapsed >= rx_timeout {
                 return Some(format!("No RX traffic for {} seconds", elapsed.as_secs()));
+            }
+
+            if is_reconnecting {
+                if elapsed >= Duration::from_secs(15) {
+                    return Some(format!("No RX traffic for 15 seconds while reconnecting"));
+                }
             }
         }
 
@@ -414,7 +415,7 @@ impl WatchdogManager {
             let is_connected = is_connected_fn().await;
 
             // Check health
-            let health = self.check_health(is_connected).await;
+            let health = self.check_health().await;
 
             // Log status periodically (every 5 minutes - not noisy)
             if last_log.elapsed() >= Duration::from_secs(300) {
@@ -525,12 +526,12 @@ mod tests {
         let watchdog = WatchdogManager::new();
 
         // Initial state should be disconnected
-        let health = watchdog.check_health(false).await;
+        let health = watchdog.check_health().await;
         assert_eq!(health, HealthStatus::Disconnected);
 
         // Mark connected
         watchdog.mark_connected().await;
-        let health = watchdog.check_health(true).await;
+        let health = watchdog.check_health().await;
         assert_eq!(health, HealthStatus::Healthy);
 
         // Record traffic
@@ -552,7 +553,7 @@ mod tests {
         sleep(Duration::from_millis(150)).await;
 
         // Should detect unhealthy state
-        let health = watchdog.check_health(true).await;
+        let health = watchdog.check_health().await;
         assert_eq!(health, HealthStatus::Unhealthy);
 
         // Should suggest reconnection

@@ -7,7 +7,7 @@
 //! Reference: <https://gadgetbridge.org/internals/specifics/garmin-protocol/#multi-link-reliable-protocol>
 
 use crate::types::{GarminError, Result};
-use log::{debug, error, info, warn};
+use log::{debug, error, warn};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -142,14 +142,7 @@ impl MlrCommunicator {
 
                 if let Err(e) = Self::check_retransmit_timeout(&state, &sender).await {
                     error!("Retransmit timeout check failed: {}", e);
-                    // If error contains "Not connected", clear MLR state to stop retries
-                    let err_msg = format!("{}", e);
-                    if err_msg.contains("Not connected") || err_msg.contains("not connected") {
-                        warn!(
-                            "Detected disconnection - clearing MLR state to stop retransmissions"
-                        );
-                        Self::clear_state(&state).await;
-                    }
+                    Self::clear_state(&state).await;
                 }
             }
         });
@@ -248,7 +241,7 @@ impl MlrCommunicator {
                 // In-sequence packet
                 let data = packet[2..].to_vec();
                 state.next_rcv_seq = (state.next_rcv_seq + 1) % (MAX_SEQ_NUM + 1);
-                info!("Scheduling ACK");
+                debug!("Scheduling ACK");
                 Self::schedule_ack(&mut state);
                 drop(state);
 
@@ -596,7 +589,10 @@ impl MlrCommunicator {
                             packets.push((task_name, packet, i));
                         } else {
                             error!("Attempting to re-send null fragment at index {}", i);
-                            return Ok(());
+                            return Err(GarminError::Io(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "Attempting to re-send null fragment",
+                            )));
                         }
                         i = (i + 1) % (MAX_SEQ_NUM + 1);
                     }

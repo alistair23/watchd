@@ -174,7 +174,6 @@ impl UrlCalendarProvider {
                 }
             } else if let Some(key) = multiline_key.take() {
                 // Finish the multiline value
-                debug!("ICS Parser: {} = {}", key, multiline_value);
                 current_event.insert(key, multiline_value.clone());
                 multiline_value.clear();
             }
@@ -187,27 +186,16 @@ impl UrlCalendarProvider {
                 in_event = true;
                 current_event.clear();
                 vevent_count += 1;
-                debug!("ICS Parser: Starting VEVENT #{}", vevent_count);
             } else if line_trimmed == "END:VEVENT" && in_event {
                 // Flush any pending multiline value
                 if let Some(key) = multiline_key.take() {
-                    debug!("ICS Parser: {} = {}", key, multiline_value);
                     current_event.insert(key, multiline_value.clone());
                     multiline_value.clear();
                 }
 
-                debug!(
-                    "ICS Parser: Event #{} properties: {:?}",
-                    vevent_count,
-                    current_event.keys().collect::<Vec<_>>()
-                );
                 if let Some(event) =
                     Self::build_event_from_ical(&current_event, calendar_name.clone(), color)
                 {
-                    debug!(
-                        "ICS Parser: ✅ Successfully parsed event #{}: {}",
-                        vevent_count, event.title
-                    );
                     events.push(event);
                 } else {
                     failed_parse_count += 1;
@@ -218,7 +206,6 @@ impl UrlCalendarProvider {
                         current_event.contains_key("SUMMARY"),
                         current_event.contains_key("DTSTART")
                     );
-                    debug!("ICS Parser: Failed event properties: {:?}", current_event);
                 }
                 in_event = false;
             } else if in_event && !line_trimmed.is_empty() {
@@ -236,7 +223,6 @@ impl UrlCalendarProvider {
 
         // Handle any remaining multiline value
         if let Some(key) = multiline_key {
-            debug!("ICS Parser: {} = {}", key, multiline_value);
             current_event.insert(key, multiline_value);
         }
 
@@ -269,11 +255,6 @@ impl UrlCalendarProvider {
                 return expanded;
             }
         };
-
-        debug!(
-            "Expanding recurring event '{}' with RRULE: {}",
-            event.title, rrule
-        );
 
         // Parse RRULE - simple implementation for common cases
         let mut freq = None;
@@ -340,13 +321,6 @@ impl UrlCalendarProvider {
                 instance.start_timestamp = current_start;
                 instance.end_timestamp = current_end;
                 instance.rrule = None; // Remove RRULE from instances
-
-                debug!(
-                    "Generated instance {} of '{}' at timestamp {}",
-                    instance_count + 1,
-                    event.title,
-                    current_start
-                );
 
                 expanded.push(instance);
             }
@@ -480,11 +454,6 @@ impl UrlCalendarProvider {
             dt_str.trim()
         };
 
-        debug!(
-            "ICS Parser: Parsing datetime '{}' (original: '{}')",
-            clean_str, dt_str
-        );
-
         if clean_str.len() == 8 {
             // Date only (all-day event) - use midnight UTC
             let year = match clean_str[0..4].parse::<i32>() {
@@ -520,11 +489,6 @@ impl UrlCalendarProvider {
 
             match Utc.with_ymd_and_hms(year, month, day, 0, 0, 0).single() {
                 Some(dt) => {
-                    debug!(
-                        "ICS Parser: Parsed date '{}' -> {}",
-                        clean_str,
-                        dt.timestamp()
-                    );
                     return Some(dt.timestamp());
                 }
                 None => {
@@ -604,14 +568,7 @@ impl UrlCalendarProvider {
                     .with_ymd_and_hms(year, month, day, hour, minute, second)
                     .single()
                 {
-                    Some(dt) => {
-                        debug!(
-                            "ICS Parser: Parsed UTC datetime '{}' -> {}",
-                            clean_str,
-                            dt.timestamp()
-                        );
-                        dt.timestamp()
-                    }
+                    Some(dt) => dt.timestamp(),
                     None => {
                         warn!(
                             "ICS Parser: Invalid UTC datetime {}-{:02}-{:02} {:02}:{:02}:{:02}",
@@ -628,10 +585,6 @@ impl UrlCalendarProvider {
                 {
                     Some(dt) => {
                         let utc_timestamp = dt.timestamp();
-                        debug!(
-                            "ICS Parser: Parsed local datetime '{}' -> {} (UTC timestamp)",
-                            clean_str, utc_timestamp
-                        );
                         utc_timestamp
                     }
                     None => {
@@ -742,7 +695,6 @@ impl UrlCalendarProvider {
             let cache = self.cache.lock().await;
             if let Some((data, timestamp)) = cache.get(url) {
                 if timestamp.elapsed() < self.cache_duration {
-                    debug!("Using cached ICS data for URL: {}", url);
                     return Ok(data.clone());
                 }
             }

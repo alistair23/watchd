@@ -11,7 +11,7 @@ use crate::data_transfer::DataTransferHandler;
 use crate::types::{GarminError, Result};
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use log::debug;
+use log::{debug, error, info};
 use reqwest;
 use std::collections::HashMap;
 use std::io::Write;
@@ -139,12 +139,10 @@ impl HttpRequest {
                 let (len, len_bytes) = read_varint(&data[pos..])?;
                 pos += len_bytes;
                 let raw_request_data = &data[pos..pos + len];
-                println!("   🔍 HTTP REQUEST came in FIELD {}", field_number);
-                println!("      Field {} = {} bytes", field_number, len);
                 if field_number == 1 {
-                    println!("      → ConnectIQHTTPRequest (should respond with field 2)");
+                    info!("      → ConnectIQHTTPRequest (should respond with field 2)");
                 } else if field_number == 5 {
-                    println!("      → RawResourceRequest (should respond with field 6)");
+                    info!("      → RawResourceRequest (should respond with field 6)");
                 }
                 debug!("Found rawRequest in field {}, {} bytes", field_number, len);
                 return Self::parse_raw_request(raw_request_data, field_number as u8);
@@ -240,10 +238,6 @@ impl HttpRequest {
                             let header_data = &data[pos..pos + len];
 
                             debug!("Parsing ConnectIQ headers (Monkey-C format): {} bytes", len);
-                            println!(
-                                "   📋 Parsing ConnectIQ headers (Monkey-C format): {} bytes",
-                                len
-                            );
                             let header_hex: String = header_data
                                 .iter()
                                 .take(100)
@@ -269,7 +263,6 @@ impl HttpRequest {
                                 Ok(json_bytes) => {
                                     let json_str = String::from_utf8_lossy(&json_bytes);
                                     debug!("Decoded headers JSON: {}", json_str);
-                                    println!("      ✅ Decoded headers JSON: {}", json_str);
 
                                     // Parse the JSON to extract header key-value pairs
                                     if let Ok(json_value) =
@@ -293,18 +286,13 @@ impl HttpRequest {
                                                     _ => value.to_string(),
                                                 };
                                                 debug!("Header: {} = {}", key, value_str);
-                                                println!(
-                                                    "         Header: {} = {}",
-                                                    key, value_str
-                                                );
                                                 headers.insert(key.to_lowercase(), value_str);
                                             }
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    debug!("Failed to decode Monkey-C headers: {}", e);
-                                    println!("      ❌ Failed to decode Monkey-C headers: {}", e);
+                                    error!("Failed to decode Monkey-C headers: {}", e);
                                 }
                             }
                             pos += len;
@@ -376,20 +364,15 @@ impl HttpRequest {
                     let (len, len_bytes) = read_varint(&data[pos..])?;
                     pos += len_bytes;
                     let body_data = &data[pos..pos + len];
-                    debug!("Body field found: {} bytes total", body_data.len());
-                    debug!(
-                        "Body data (first 32 bytes): {:02X?}",
-                        &body_data[..std::cmp::min(32, body_data.len())]
-                    );
-                    println!("   📦 RAW BODY DATA FROM WATCH:");
-                    println!("      Size: {} bytes", body_data.len());
+                    debug!("   📦 RAW BODY DATA FROM WATCH:");
+                    debug!("      Size: {} bytes", body_data.len());
                     let hex_dump: String = body_data
                         .iter()
                         .take(200)
                         .map(|b| format!("{:02X}", b))
                         .collect::<Vec<_>>()
                         .join(" ");
-                    println!("      Hex (first 200 bytes): {}", hex_dump);
+                    debug!("      Hex (first 200 bytes): {}", hex_dump);
 
                     // Check for Garmin's custom encoding with AB CD AB CD marker
                     if body_data.len() >= 4
@@ -429,15 +412,15 @@ impl HttpRequest {
                             String::from_utf8_lossy(&body[..std::cmp::min(200, body.len())])
                         );
 
-                        println!("   🔄 CONVERTING GARMIN BINARY TO JSON:");
-                        println!("      Input size: {} bytes", body.len());
+                        debug!("   🔄 CONVERTING GARMIN BINARY TO JSON:");
+                        debug!("      Input size: {} bytes", body.len());
                         let input_hex: String = body
                             .iter()
-                            .take(600)
+                            .take(1000)
                             .map(|b| format!("{:02X}", b))
                             .collect::<Vec<_>>()
                             .join(" ");
-                        println!("      Input hex (first 600 bytes): {}", input_hex);
+                        debug!("      Input hex (first 1000 bytes): {}", input_hex);
 
                         // Try to convert Garmin format to JSON
                         match convert_garmin_body_to_json(&body) {
@@ -446,11 +429,8 @@ impl HttpRequest {
                                     "Successfully converted Garmin body to JSON: {} bytes",
                                     json_body.len()
                                 );
-                                println!(
-                                    "      ✅ Conversion successful: {} bytes",
-                                    json_body.len()
-                                );
-                                println!(
+                                debug!("      ✅ Conversion successful: {} bytes", json_body.len());
+                                debug!(
                                     "      Output JSON: {}",
                                     String::from_utf8_lossy(&json_body)
                                 );
@@ -459,19 +439,19 @@ impl HttpRequest {
                                 if request_field == 1 {
                                     match transform_connectiq_json(&json_body) {
                                         Ok(transformed) => {
-                                            println!("      🔄 ConnectIQ transformation applied");
-                                            println!(
+                                            debug!("      🔄 ConnectIQ transformation applied");
+                                            debug!(
                                                 "      Transformed JSON: {}",
                                                 String::from_utf8_lossy(&transformed)
                                             );
                                             body = transformed;
                                         }
                                         Err(e) => {
-                                            debug!(
+                                            error!(
                                                 "Failed to transform ConnectIQ JSON: {}, using original",
                                                 e
                                             );
-                                            println!("      ⚠️ Transformation failed: {}", e);
+                                            error!("      ⚠️ Transformation failed: {}", e);
                                             body = json_body;
                                         }
                                     }
@@ -480,12 +460,10 @@ impl HttpRequest {
                                 }
                             }
                             Err(e) => {
-                                debug!(
+                                error!(
                                     "Failed to convert Garmin body to JSON: {}, using raw data",
                                     e
                                 );
-                                println!("      ❌ Conversion failed: {}", e);
-                                println!("      Using raw data as-is");
                                 // Keep the raw body as-is
                             }
                         }
@@ -547,10 +525,6 @@ impl HttpRequest {
                             pos += len_bytes;
                             compress_response_body = val != 0;
                             debug!("Parsed compressResponseBody: {}", compress_response_body);
-                            println!(
-                                "   📦 ConnectIQ compressResponseBody: {}",
-                                compress_response_body
-                            );
                         } else {
                             debug!("Unexpected wire type {} for field 7, skipping", wire_type);
                             skip_field(wire_type, &data[pos..], &mut pos)?;
@@ -588,8 +562,7 @@ impl HttpRequest {
                             let (val, len_bytes) = read_varint(&data[pos..])?;
                             pos += len_bytes;
                             response_type = Some(val as u32);
-                            debug!("Parsed responseType: {}", val);
-                            println!("   📦 ConnectIQ responseType: {}", val);
+                            debug!("   📦 ConnectIQ responseType: {}", val);
                         } else {
                             debug!("Unexpected wire type {} for field 8, skipping", wire_type);
                             skip_field(wire_type, &data[pos..], &mut pos)?;
@@ -605,8 +578,7 @@ impl HttpRequest {
                             let (val, len_bytes) = read_varint(&data[pos..])?;
                             pos += len_bytes;
                             version = Some(val as u32);
-                            debug!("Parsed version: {}", val);
-                            println!("   📦 ConnectIQ version: {}", val);
+                            debug!("   📦 ConnectIQ version: {}", val);
                         } else {
                             debug!("Unexpected wire type {} for field 9, skipping", wire_type);
                             skip_field(wire_type, &data[pos..], &mut pos)?;
@@ -634,22 +606,22 @@ impl HttpRequest {
         );
 
         // Log detailed summary
-        println!("   ✅ Parsed HTTP request successfully:");
-        println!("      Method: {}", method.as_str());
-        println!("      URL: {}", url);
-        println!("      Path: {}", path);
-        println!("      Headers: {}", headers.len());
+        debug!("   ✅ Parsed HTTP request successfully:");
+        debug!("      Method: {}", method.as_str());
+        debug!("      URL: {}", url);
+        debug!("      Path: {}", path);
+        debug!("      Headers: {}", headers.len());
         for (key, value) in &headers {
             let value_preview = if value.len() > 50 {
                 format!("{}... ({} bytes)", &value[..50], value.len())
             } else {
                 value.clone()
             };
-            println!("         {}: {}", key, value_preview);
+            debug!("         {}: {}", key, value_preview);
         }
-        println!("      Body: {} bytes", body.len());
+        debug!("      Body: {} bytes", body.len());
         if body.len() > 0 {
-            println!(
+            debug!(
                 "      Body preview (first 100 chars): {}",
                 String::from_utf8_lossy(&body[..std::cmp::min(100, body.len())])
             );
@@ -669,13 +641,6 @@ impl HttpRequest {
             max_response_length,
             version,
         };
-
-        // Warn if DataTransfer is requested but not yet implemented
-        if use_data_xfer {
-            println!("   ⚠️  WARNING: Request has useDataXfer=true, but DataTransfer is not yet implemented!");
-            println!("      The watch may expect the response body via DataTransfer service");
-            println!("      instead of directly in the HTTP response body field.");
-        }
 
         Ok(request)
     }
@@ -747,11 +712,6 @@ impl HttpResponse {
             6 // RawResourceRequest (field 5) → RawResourceResponse (field 6)
         };
 
-        println!(
-            "   🔄 Request came from field {}, responding with field {}",
-            request.request_field, response_field
-        );
-
         // For ConnectIQ responses (field 2), use simpler structure with just Monkey C body
         if response_field == 2 {
             return self.encode_connectiq_response(request_id, request);
@@ -787,7 +747,7 @@ impl HttpResponse {
                 .unwrap_or("");
 
             if accept_encoding == "gzip" {
-                println!("   🗜️  Compressing response with gzip");
+                info!("   🗜️  Compressing response with gzip");
                 let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
                 encoder.write_all(&self.body).map_err(|e| {
                     GarminError::InvalidMessage(format!("Failed to compress response: {}", e))
@@ -798,8 +758,8 @@ impl HttpResponse {
 
                 // Add Content-Encoding header
                 response_headers.insert("Content-Encoding".to_string(), "gzip".to_string());
-                println!("      Original size: {} bytes", self.body.len());
-                println!("      Compressed size: {} bytes", compressed.len());
+                debug!("      Original size: {} bytes", self.body.len());
+                debug!("      Compressed size: {} bytes", compressed.len());
                 compressed
             } else {
                 // For uncompressed data, explicitly set Content-Encoding to identity
@@ -818,16 +778,13 @@ impl HttpResponse {
         let transfer_id = if should_use_data_transfer && data_transfer.is_some() {
             let handler = data_transfer.unwrap();
             let id = handler.register(body_data.clone());
-            println!("   📦 Using DataTransfer for response body");
-            println!("      Transfer ID: {}", id);
-            println!("      Body size: {} bytes", body_data.len());
-            if request.use_data_xfer {
-                println!("      Reason: Request has useDataXfer=true");
-            }
+            info!("   📦 Using DataTransfer for response body");
+            info!("      Transfer ID: {}", id);
+            info!("      Body size: {} bytes", body_data.len());
             Some(id)
         } else if should_use_data_transfer {
-            println!("   ⚠️  DataTransfer needed but handler not provided - falling back to body");
-            println!("      Body size: {} bytes", body_data.len());
+            error!("   ⚠️  DataTransfer needed but handler not provided - falling back to body");
+            error!("      Body size: {} bytes", body_data.len());
             None
         } else {
             None
@@ -846,23 +803,23 @@ impl HttpResponse {
             xfer_data.push((2 << 3) | 0); // Field 2: size (varint)
             xfer_data.extend_from_slice(&encode_varint(body_data.len()));
 
-            println!("   📦 Sending DataTransfer reference (field 4)");
-            println!("      Transfer ID: {}", id);
-            println!("      Size: {} bytes", body_data.len());
+            info!("   📦 Sending DataTransfer reference (field 4)");
+            info!("      Transfer ID: {}", id);
+            info!("      Size: {} bytes", body_data.len());
 
             raw_response.push((4 << 3) | 2); // Field 4, length-delimited
             raw_response.extend_from_slice(&encode_varint(xfer_data.len()));
             raw_response.extend_from_slice(&xfer_data);
         } else if !body_data.is_empty() {
             // Use direct body (field 3)
-            println!("   📦 Sending response body as raw JSON/bytes (not converting)");
-            println!("      Response size: {} bytes", body_data.len());
-            if body_data.len() < 500 {
-                println!(
+            info!("   📦 Sending response body as raw JSON/bytes (not converting)");
+            info!("      Response size: {} bytes", body_data.len());
+            if body_data.len() < 1000 {
+                debug!(
                     "      Response content: {}",
                     String::from_utf8_lossy(&body_data)
                 );
-                println!("      Response content direct: {:?}", &body_data);
+                debug!("      Response content direct: {:?}", &body_data);
             }
 
             raw_response.push((3 << 3) | 2); // Field 3, length-delimited
@@ -909,16 +866,16 @@ impl HttpResponse {
         http_service.extend_from_slice(&encode_varint(raw_response.len()));
         http_service.extend_from_slice(&raw_response);
 
-        println!("   📋 RawResponse structure:");
-        println!("      Field 1 (status): {} (enum value)", status_enum);
-        println!("      Field 2 (httpStatus): {}", self.status);
-        println!("      Field 3 (body): {} bytes", self.body.len());
-        println!(
+        debug!("   📋 RawResponse structure:");
+        debug!("      Field 1 (status): {} (enum value)", status_enum);
+        debug!("      Field 2 (httpStatus): {}", self.status);
+        debug!("      Field 3 (body): {} bytes", self.body.len());
+        debug!(
             "      Field 5 (headers): {} headers (non-empty), {} skipped",
             non_empty_headers.len(),
             empty_count
         );
-        println!("      Total RawResponse size: {} bytes", raw_response.len());
+        debug!("      Total RawResponse size: {} bytes", raw_response.len());
 
         // Dump complete RawResponse hex for debugging
         let raw_hex: String = raw_response
@@ -926,9 +883,9 @@ impl HttpResponse {
             .map(|b| format!("{:02X}", b))
             .collect::<Vec<_>>()
             .join(" ");
-        println!("      RawResponse hex (complete):");
+        debug!("      RawResponse hex (complete):");
         for (i, chunk) in raw_hex.as_bytes().chunks(96).enumerate() {
-            println!("        {:04}: {}", i * 48, String::from_utf8_lossy(chunk));
+            debug!("        {:04}: {}", i * 48, String::from_utf8_lossy(chunk));
         }
 
         // Build Smart message with http_service (field 2)
@@ -936,14 +893,6 @@ impl HttpResponse {
         smart_proto.push((2 << 3) | 2); // Field 2, length-delimited
         smart_proto.extend_from_slice(&encode_varint(http_service.len()));
         smart_proto.extend_from_slice(&http_service);
-
-        println!("   📋 HttpService structure:");
-        println!(
-            "      Field {} (response): {} bytes",
-            response_field,
-            raw_response.len()
-        );
-        println!("      Total HttpService size: {} bytes", http_service.len());
 
         // Dump HttpService hex
         let http_service_hex: String = http_service
@@ -956,10 +905,6 @@ impl HttpResponse {
             "      HttpService hex (first 128 bytes): {}",
             http_service_hex
         );
-
-        println!("   📋 Smart proto structure:");
-        println!("      Field 2 (http_service): {} bytes", http_service.len());
-        println!("      Total Smart proto size: {} bytes", smart_proto.len());
 
         // Dump Smart proto hex
         let smart_hex: String = smart_proto
@@ -1002,20 +947,18 @@ impl HttpResponse {
         let checksum = compute_checksum(&message);
         message.extend_from_slice(&checksum.to_le_bytes());
 
-        println!("   📋 Final ProtobufResponse message:");
-        println!("      Packet size: {} bytes", packet_size);
-        println!("      Message ID: 5044 (PROTOBUF_RESPONSE)");
-        println!("      Request ID: {}", request_id);
-        println!("      Protobuf payload size: {} bytes", smart_proto.len());
-        println!("      Checksum: 0x{:04X}", checksum);
-        println!("      Total message size: {} bytes", message.len());
+        debug!("   📋 Final ProtobufResponse message:");
+        debug!("      Packet size: {} bytes", packet_size);
+        debug!("      Request ID: {}", request_id);
+        debug!("      Protobuf payload size: {} bytes", smart_proto.len());
+        debug!("      Total message size: {} bytes", message.len());
         let msg_hex: String = message
             .iter()
             .take(128)
             .map(|b| format!("{:02X}", b))
             .collect::<Vec<_>>()
             .join(" ");
-        println!("      Message hex (first 128 bytes): {}", msg_hex);
+        debug!("      Message hex (first 128 bytes): {}", msg_hex);
 
         Ok(message)
     }
@@ -1023,14 +966,14 @@ impl HttpResponse {
     /// Encode a ConnectIQ HTTP response (field 2)
     /// This uses a simpler structure with just the Monkey C encoded body
     fn encode_connectiq_response(&self, request_id: u16, request: &HttpRequest) -> Result<Vec<u8>> {
-        println!("   📦 Encoding ConnectIQ response (field 2)");
+        info!("   📦 Encoding ConnectIQ response (field 2)");
 
         // Convert JSON response body to Monkey C format
         let monkeyc_body = if !self.body.is_empty() {
-            println!("   📦 Converting JSON response to Monkey C format");
-            println!("      Response size: {} bytes", self.body.len());
+            info!("   📦 Converting JSON response to Monkey C format");
+            debug!("      Response size: {} bytes", self.body.len());
             if self.body.len() < 500 {
-                println!(
+                debug!(
                     "      Response content: {}",
                     String::from_utf8_lossy(&self.body)
                 );
@@ -1038,12 +981,11 @@ impl HttpResponse {
 
             match convert_json_to_garmin_body(&self.body) {
                 Ok(body) => {
-                    println!("   ✅ Converted to Monkey C body: {} bytes", body.len());
+                    info!("   ✅ Converted to Monkey C body: {} bytes", body.len());
                     body
                 }
                 Err(e) => {
-                    println!("   ⚠️  Failed to convert to Monkey C: {}", e);
-                    println!("      Sending raw JSON as fallback");
+                    error!("   ⚠️  Failed to convert to Monkey C: {}", e);
                     self.body.clone()
                 }
             }
@@ -1934,7 +1876,121 @@ fn convert_garmin_body_to_json(data: &[u8]) -> Result<Vec<u8>> {
     debug!("Converted to JSON: {}", json);
     println!("      ✅ Conversion successful: {} bytes", json.len());
     println!("      Output JSON: {}", json);
-    Ok(json.into_bytes())
+
+    // Post-process sensor states to move metadata from array to root level
+    // and fix schema mismatches
+    let json_bytes = json.into_bytes();
+    let cleaned_json = clean_sensor_states_structure(&json_bytes)?;
+    let fixed_json = fix_sensor_schema_mismatches(&cleaned_json)?;
+    Ok(fixed_json)
+}
+
+/// Clean up sensor states structure by moving metadata from data array to root level
+fn clean_sensor_states_structure(json_data: &[u8]) -> Result<Vec<u8>> {
+    use std::str;
+
+    let json_str = str::from_utf8(json_data)
+        .map_err(|e| GarminError::InvalidMessage(format!("Invalid UTF-8 in JSON: {}", e)))?;
+
+    let mut json_value: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| GarminError::InvalidMessage(format!("Failed to parse JSON: {}", e)))?;
+
+    // Check if this matches sensor states pattern: data array starts with "type", "update_sensor_states"
+    if let Some(obj) = json_value.as_object_mut() {
+        if let Some(data_array) = obj.get_mut("data").and_then(|v| v.as_array_mut()) {
+            // Check if first two elements are the metadata strings
+            if data_array.len() >= 2
+                && data_array[0].as_str() == Some("type")
+                && data_array[1].as_str() == Some("update_sensor_states")
+            {
+                debug!("Cleaning sensor states structure: moving metadata to root level");
+
+                // Remove the first two elements (metadata)
+                data_array.remove(0); // Remove "type"
+                let type_value = data_array.remove(0); // Remove and get "update_sensor_states"
+
+                // Set the root-level "type" to "update_sensor_states"
+                obj.insert("type".to_string(), type_value);
+
+                debug!("Sensor states structure cleaned: metadata moved to root level");
+            }
+        }
+    }
+
+    // Convert back to JSON bytes
+    serde_json::to_vec(&json_value).map_err(|e| {
+        GarminError::InvalidMessage(format!("Failed to serialize cleaned JSON: {}", e))
+    })
+}
+
+/// Fix schema mismatches in sensor data
+/// Specifically handles the case where respiration_rate's icon field gets parsed
+/// as part of the activity sensor due to schema count mismatch
+fn fix_sensor_schema_mismatches(json_data: &[u8]) -> Result<Vec<u8>> {
+    use std::str;
+
+    let json_str = str::from_utf8(json_data)
+        .map_err(|e| GarminError::InvalidMessage(format!("Invalid UTF-8 in JSON: {}", e)))?;
+
+    let mut json_value: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| GarminError::InvalidMessage(format!("Failed to parse JSON: {}", e)))?;
+
+    // Check if this is sensor states data
+    if let Some(obj) = json_value.as_object_mut() {
+        if obj.get("type").and_then(|v| v.as_str()) == Some("update_sensor_states") {
+            if let Some(data_array) = obj.get_mut("data").and_then(|v| v.as_array_mut()) {
+                // Find respiration_rate and activity sensors
+                let mut respiration_idx = None;
+                let mut activity_idx = None;
+
+                for (idx, item) in data_array.iter().enumerate() {
+                    if let Some(sensor_obj) = item.as_object() {
+                        if let Some(unique_id) =
+                            sensor_obj.get("unique_id").and_then(|v| v.as_str())
+                        {
+                            if unique_id == "respiration_rate" {
+                                respiration_idx = Some(idx);
+                            } else if unique_id == "activity" {
+                                activity_idx = Some(idx);
+                            }
+                        }
+                    }
+                }
+
+                // If both sensors exist and activity has an icon field but no type field,
+                // we need to fix the mismatch
+                if let (Some(resp_idx), Some(act_idx)) = (respiration_idx, activity_idx) {
+                    let activity_obj = data_array[act_idx].as_object().cloned();
+
+                    if let Some(act_obj) = activity_obj {
+                        // Check if activity has icon but no type (indicates mismatch)
+                        if act_obj.contains_key("icon") && !act_obj.contains_key("type") {
+                            debug!("Detected schema mismatch: fixing respiration_rate and activity sensors");
+
+                            // Move icon from activity to respiration_rate
+                            if let Some(icon_value) = act_obj.get("icon") {
+                                if let Some(resp_obj) = data_array[resp_idx].as_object_mut() {
+                                    resp_obj.insert("icon".to_string(), icon_value.clone());
+                                }
+                            }
+
+                            // Remove icon from activity and add type
+                            if let Some(act_obj_mut) = data_array[act_idx].as_object_mut() {
+                                act_obj_mut.remove("icon");
+                                act_obj_mut.insert("type".to_string(), serde_json::json!("sensor"));
+                            }
+
+                            debug!("Schema mismatch fixed: icon moved to respiration_rate, type added to activity");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Convert back to JSON bytes
+    serde_json::to_vec(&json_value)
+        .map_err(|e| GarminError::InvalidMessage(format!("Failed to serialize fixed JSON: {}", e)))
 }
 
 /// Convert GarminValue to JSON string, handling duplicate keys
@@ -2104,19 +2160,8 @@ fn parse_monkeyc_value(
                     as usize;
             *pos += 4;
 
-            println!(
-                "         🔍 String ref lookup: offset={}, available={:?}",
-                offset,
-                {
-                    let mut keys: Vec<_> = string_dict.keys().cloned().collect();
-                    keys.sort();
-                    keys
-                }
-            );
-
             if let Some(string) = string_dict.get(&offset) {
                 debug!("String reference [offset={}]: {}", offset, string);
-                println!("         ✅ Found: \"{}\"", string);
                 Ok(GarminValue::String(string.clone()))
             } else {
                 debug!(
@@ -2124,7 +2169,6 @@ fn parse_monkeyc_value(
                     offset,
                     string_dict.keys()
                 );
-                println!("         ❌ NOT FOUND!");
                 Ok(GarminValue::Null)
             }
         }
@@ -2142,12 +2186,36 @@ fn parse_monkeyc_value(
                     as usize;
             *pos += 4;
             debug!("Parsing array with {} elements", count);
-            println!("         🔍 Array at pos {}: {} elements", *pos - 4, count);
 
             let mut items = Vec::new();
-            for _ in 0..count {
+            let mut parsed_count = 0;
+
+            // Parse array elements, flattening any schema-first arrays
+            while parsed_count < count {
                 let value = parse_monkeyc_value(data, pos, string_dict, header_start)?;
-                items.push(value);
+                parsed_count += 1;
+
+                // If the value is an array (from schema-first object decoding), flatten it
+                match value {
+                    GarminValue::Array(inner_items) => {
+                        // This is a schema-first decoded array - flatten it into parent
+                        items.extend(inner_items);
+
+                        // If flattening caused us to reach or exceed the expected count,
+                        // we're done parsing this array
+                        if items.len() >= count {
+                            debug!(
+                                "Array flattening complete: {} items (target: {}), stopping parse",
+                                items.len(),
+                                count
+                            );
+                            break;
+                        }
+                    }
+                    _ => {
+                        items.push(value);
+                    }
+                }
             }
 
             Ok(GarminValue::Array(items))
@@ -2179,18 +2247,77 @@ fn parse_monkeyc_value(
                     as usize;
             *pos += 4;
             debug!("Parsing object with {} fields", count);
-            println!("         🔍 Object at pos {}: {} fields", *pos - 4, count);
 
-            let mut fields = Vec::new();
-            for i in 0..count {
-                let field_start_pos = *pos;
-                println!(
-                    "         📍 Parsing field {}/{} at pos {}",
-                    i + 1,
-                    count,
-                    field_start_pos
+            // Check for schema-first encoding: if the first "key" is an object marker (0x0B),
+            // this indicates a compressed encoding where object schemas are defined first,
+            // followed by the actual data for all objects
+            if *pos < data.len() && data[*pos] == 0x0B && count > 0 {
+                debug!("Detected schema-first object encoding");
+
+                // Parse schema definitions (consecutive 0x0B markers with field counts)
+                // Note: We parse ALL consecutive 0x0B markers, not just 'count' of them
+                // because the 'count' refers to the parent object structure, not the number of schemas
+                let mut schema_definitions = Vec::new();
+                while *pos < data.len() && data[*pos] == 0x0B {
+                    *pos += 1; // Skip 0x0B marker
+                    if *pos + 4 > data.len() {
+                        break;
+                    }
+                    let field_count = i32::from_be_bytes([
+                        data[*pos],
+                        data[*pos + 1],
+                        data[*pos + 2],
+                        data[*pos + 3],
+                    ]) as usize;
+                    *pos += 4;
+                    schema_definitions.push(field_count);
+                    debug!(
+                        "Schema definition {}: {} fields",
+                        schema_definitions.len(),
+                        field_count
+                    );
+                }
+
+                debug!(
+                    "Parsed {} schema definitions at pos {}",
+                    schema_definitions.len(),
+                    *pos
                 );
 
+                // Now parse the actual objects using the schema definitions
+                // Data is laid out as: all fields for obj1, all fields for obj2, etc.
+                // Each field is: key (string ref), value (any type)
+                let mut objects = Vec::new();
+                for (obj_idx, field_count) in schema_definitions.iter().enumerate() {
+                    let mut obj_fields = Vec::new();
+                    for i in 0..*field_count {
+                        // Parse key (should be a string reference)
+                        let key_value = parse_monkeyc_value(data, pos, string_dict, header_start)?;
+                        let key = match key_value {
+                            GarminValue::String(s) => s,
+                            _ => format!("field_{}", i),
+                        };
+
+                        // Parse value (immediately follows key)
+                        let value = parse_monkeyc_value(data, pos, string_dict, header_start)?;
+                        obj_fields.push((key, value));
+                    }
+                    debug!("Parsed schema-first object {}: {:?}", obj_idx, obj_fields);
+                    objects.push(GarminValue::Object(obj_fields));
+                }
+
+                debug!(
+                    "Schema-first parsing complete: {} objects parsed",
+                    objects.len()
+                );
+
+                // Return as an array of objects
+                return Ok(GarminValue::Array(objects));
+            }
+
+            // Standard object parsing (key-value pairs)
+            let mut fields = Vec::new();
+            for i in 0..count {
                 // Parse key (should be a string reference, type 0x03)
                 let key_value = parse_monkeyc_value(data, pos, string_dict, header_start)?;
                 let key = match key_value {
@@ -2198,30 +2325,8 @@ fn parse_monkeyc_value(
                     _ => format!("field_{}", i),
                 };
 
-                let value_start_pos = *pos;
-                println!(
-                    "            Key: \"{}\" (pos after key: {})",
-                    key, value_start_pos
-                );
-
                 // Parse value
                 let value = parse_monkeyc_value(data, pos, string_dict, header_start)?;
-
-                println!(
-                    "            Value type: {:?} (pos after value: {})",
-                    match &value {
-                        GarminValue::Null => "Null",
-                        GarminValue::Integer(_) => "Integer",
-                        GarminValue::Float(_) => "Float",
-                        GarminValue::String(_) => "String",
-                        GarminValue::Boolean(_) => "Boolean",
-                        GarminValue::Long(_) => "Long",
-                        GarminValue::Double(_) => "Double",
-                        GarminValue::Object(_) => "Object",
-                        GarminValue::Array(_) => "Array",
-                    },
-                    *pos
-                );
 
                 debug!("Object field: {} = {:?}", key, value);
                 fields.push((key, value));
@@ -2644,6 +2749,137 @@ mod tests {
         assert_eq!(encode_varint(127), vec![127]);
         assert_eq!(encode_varint(128), vec![0x80, 0x01]);
         assert_eq!(encode_varint(300), vec![0xAC, 0x02]);
+    }
+
+    #[test]
+    fn test_sensor_states_schema_first_decoding() {
+        // This is real sensor states data from a Garmin watch using schema-first encoding
+        let hex_str = "00 05 64 61 74 61 00 00 05 74 79 70 65 00 00 15 75 70 64 61 74 65 5F 73 65 6E 73 6F 72 5F 73 74 61 74 65 73 00 00 0A 75 6E 69 71 75 65 5F 69 64 00 00 0E 62 61 74 74 65 72 79 5F 6C 65 76 65 6C 00 00 06 73 74 61 74 65 00 00 07 73 65 6E 73 6F 72 00 00 05 69 63 6F 6E 00 00 0C 6D 64 69 3A 62 61 74 74 65 72 79 00 00 14 62 61 74 74 65 72 79 5F 69 73 5F 63 68 61 72 67 69 6E 67 00 00 0E 62 69 6E 61 72 79 5F 73 65 6E 73 6F 72 00 00 12 6D 64 69 3A 62 61 74 74 65 72 79 2D 6D 69 6E 75 73 00 00 0C 73 74 65 70 73 5F 74 6F 64 61 79 00 00 09 6D 64 69 3A 77 61 6C 6B 00 00 0B 68 65 61 72 74 5F 72 61 74 65 00 00 10 6D 64 69 3A 68 65 61 72 74 2D 70 75 6C 73 65 00 00 15 66 6C 6F 6F 72 73 5F 63 6C 69 6D 62 65 64 5F 74 6F 64 61 79 00 00 0E 6D 64 69 3A 73 74 61 69 72 73 2D 75 70 00 00 17 66 6C 6F 6F 72 73 5F 64 65 73 63 65 6E 64 65 64 5F 74 6F 64 61 79 00 00 10 6D 64 69 3A 73 74 61 69 72 73 2D 64 6F 77 6E 00 00 11 72 65 73 70 69 72 61 74 69 6F 6E 5F 72 61 74 65 00 00 0A 6D 64 69 3A 6C 75 6E 67 73 00 00 09 61 63 74 69 76 69 74 79 00 00 0D 73 75 62 5F 61 63 74 69 76 69 74 79 00 DA 7A DA 7A 00 00 01 97 0B 00 00 00 02 03 00 00 00 00 05 00 00 00 09 03 00 00 00 07 03 00 00 00 0E 0B 00 00 00 04 0B 00 00 00 04 0B 00 00 00 04 0B 00 00 00 04 0B 00 00 00 04 0B 00 00 00 04 0B 00 00 00 04 0B 00 00 00 03 0B 00 00 00 03 03 00 00 00 25 03 00 00 00 31 03 00 00 00 41 02 42 AF 9C 00 03 00 00 00 07 03 00 00 00 49 03 00 00 00 52 03 00 00 00 59 03 00 00 00 25 03 00 00 00 67 03 00 00 00 41 09 00 03 00 00 00 07 03 00 00 00 7D 03 00 00 00 52 03 00 00 00 8D 03 00 00 00 25 03 00 00 00 A1 03 00 00 00 41 01 00 00 0C 08 03 00 00 00 07 03 00 00 00 49 03 00 00 00 52 03 00 00 00 AF 03 00 00 00 25 03 00 00 00 BA 03 00 00 00 41 01 00 00 00 4B 03 00 00 00 07 03 00 00 00 49 03 00 00 00 52 03 00 00 00 C7 03 00 00 00 25 03 00 00 00 D9 03 00 00 00 41 01 00 00 00 02 03 00 00 00 07 03 00 00 00 49 03 00 00 00 52 03 00 00 00 F0 03 00 00 00 25 03 00 00 01 00 03 00 00 00 41 01 00 00 00 02 03 00 00 00 07 03 00 00 00 49 03 00 00 00 52 03 00 00 01 19 03 00 00 00 25 03 00 00 01 2B 03 00 00 00 41 01 00 00 00 14 03 00 00 00 07 03 00 00 00 49 03 00 00 00 52 03 00 00 01 3E 03 00 00 00 25 03 00 00 01 4A 03 00 00 00 41 01 FF FF FF FF 03 00 00 00 07 03 00 00 00 49 03 00 00 00 25 03 00 00 01 55 03 00 00 00 41 01 FF FF FF FF 03 00 00 00 07 03 00 00 00 49";
+
+        let data: Vec<u8> = hex_str
+            .split_whitespace()
+            .filter_map(|s| u8::from_str_radix(s, 16).ok())
+            .collect();
+
+        let result = convert_garmin_body_to_json(&data);
+        assert!(
+            result.is_ok(),
+            "Failed to decode sensor states: {:?}",
+            result.err()
+        );
+
+        let json_bytes = result.unwrap();
+        let json_str = String::from_utf8(json_bytes).unwrap();
+        let json_value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        println!(
+            "Decoded JSON: {}",
+            serde_json::to_string_pretty(&json_value).unwrap()
+        );
+
+        // Verify the structure
+        assert!(json_value.is_object(), "Root should be an object");
+        let obj = json_value.as_object().unwrap();
+
+        assert!(obj.contains_key("data"), "Should have 'data' field");
+
+        // Verify the data array contains sensor objects
+        let data_array = obj.get("data").and_then(|v| v.as_array()).unwrap();
+
+        // After cleaning, data array should only contain sensor objects (no metadata)
+        assert!(
+            data_array.len() >= 8,
+            "Array should have at least 8 sensor objects, got {}",
+            data_array.len()
+        );
+
+        // Verify root-level type field
+        assert!(obj.contains_key("type"), "Should have 'type' field at root");
+        assert_eq!(
+            obj.get("type").and_then(|v| v.as_str()),
+            Some("update_sensor_states"),
+            "Root type should be 'update_sensor_states'"
+        );
+
+        // Check for sensor objects with expected fields
+        let mut found_battery = false;
+        let mut found_steps = false;
+        let mut found_heart_rate = false;
+        let mut found_battery_charging = false;
+        let mut found_floors_climbed = false;
+        let mut found_respiration = false;
+
+        for item in data_array.iter() {
+            if let Some(obj) = item.as_object() {
+                if let Some(unique_id) = obj.get("unique_id").and_then(|v| v.as_str()) {
+                    match unique_id {
+                        "battery_level" => {
+                            found_battery = true;
+                            assert!(obj.contains_key("state"), "battery_level should have state");
+                            assert!(obj.contains_key("icon"), "battery_level should have icon");
+                            assert_eq!(obj.get("type").and_then(|v| v.as_str()), Some("sensor"));
+                            assert_eq!(
+                                obj.get("icon").and_then(|v| v.as_str()),
+                                Some("mdi:battery")
+                            );
+                            // State should be around 87.8
+                            let state = obj.get("state").and_then(|v| v.as_f64()).unwrap();
+                            assert!(
+                                state > 85.0 && state < 90.0,
+                                "Battery level should be ~87.8, got {}",
+                                state
+                            );
+                        }
+                        "battery_is_charging" => {
+                            found_battery_charging = true;
+                            assert_eq!(obj.get("state").and_then(|v| v.as_bool()), Some(false));
+                            assert_eq!(
+                                obj.get("type").and_then(|v| v.as_str()),
+                                Some("binary_sensor")
+                            );
+                        }
+                        "steps_today" => {
+                            found_steps = true;
+                            assert_eq!(obj.get("state").and_then(|v| v.as_i64()), Some(3080));
+                            assert_eq!(obj.get("icon").and_then(|v| v.as_str()), Some("mdi:walk"));
+                        }
+                        "heart_rate" => {
+                            found_heart_rate = true;
+                            assert_eq!(obj.get("state").and_then(|v| v.as_i64()), Some(75));
+                            assert_eq!(
+                                obj.get("icon").and_then(|v| v.as_str()),
+                                Some("mdi:heart-pulse")
+                            );
+                        }
+                        "floors_climbed_today" => {
+                            found_floors_climbed = true;
+                            assert_eq!(obj.get("state").and_then(|v| v.as_i64()), Some(2));
+                        }
+                        "respiration_rate" => {
+                            found_respiration = true;
+                            assert_eq!(obj.get("state").and_then(|v| v.as_i64()), Some(20));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        assert!(found_battery, "Should have decoded battery_level sensor");
+        assert!(
+            found_battery_charging,
+            "Should have decoded battery_is_charging sensor"
+        );
+        assert!(found_steps, "Should have decoded steps_today sensor");
+        assert!(found_heart_rate, "Should have decoded heart_rate sensor");
+        assert!(
+            found_floors_climbed,
+            "Should have decoded floors_climbed_today sensor"
+        );
+        assert!(
+            found_respiration,
+            "Should have decoded respiration_rate sensor"
+        );
     }
 
     #[test]

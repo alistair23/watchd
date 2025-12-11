@@ -209,18 +209,6 @@ impl MessageReceiver for MlrGfdiReceiver {
             // GFDI message format: [packet_size:2][message_id:2][payload...][crc:2]
             // First 2 bytes are packet size (little-endian), NOT a handle byte
 
-            // Debug: Show ALL bytes for every message
-            let hex_dump = decoded
-                .iter()
-                .map(|b| format!("{:02X}", b))
-                .collect::<Vec<_>>()
-                .join(" ");
-            debug!("Incoming message ALL bytes: {}", hex_dump);
-            debug!("Byte-by-byte breakdown:");
-            for (i, byte) in decoded.iter().enumerate() {
-                debug!("  [{}] = 0x{:02X} ({})", i, byte, byte);
-            }
-
             // Extract and log message type with sequence number and response details
             if decoded.len() >= 4 {
                 let mut raw_msg_id = u16::from_le_bytes([decoded[2], decoded[3]]);
@@ -304,7 +292,7 @@ impl MessageReceiver for MlrGfdiReceiver {
                     }
                 }
 
-                info!("GFDI message received: {}", log_parts.join(", "));
+                debug!("GFDI message received: {}", log_parts.join(", "));
             } else {
                 info!(
                     "GFDI message received: {} bytes (invalid - too short)",
@@ -1343,24 +1331,6 @@ impl CommunicatorV2 {
         state.service_by_handle.insert(handle, service);
         state.handle_by_service.insert(service, handle);
         info!("Registered service {} with handle {}", service, handle);
-    }
-
-    /// Create and register an MLR communicator for a handle
-    pub async fn create_mlr_communicator(
-        &self,
-        handle: u8,
-        sender: Arc<dyn MessageSender>,
-        receiver: Arc<dyn MessageReceiver>,
-    ) -> Result<()> {
-        let mut state = self.state.lock().await;
-
-        let mut mlr = MlrCommunicator::new(handle, state.max_write_size, sender, receiver);
-
-        mlr.start()?;
-        state.mlr_communicators.insert(handle, Arc::new(mlr));
-
-        info!("Created MLR communicator for handle {}", handle);
-        Ok(())
     }
 
     /// Dispose and clean up resources
