@@ -76,10 +76,6 @@ struct Args {
     #[arg(value_name = "MAC_ADDRESS")]
     mac_address: String,
 
-    /// Skip pairing if device is already paired (go straight to notifications)
-    #[arg(long)]
-    skip_pairing: bool,
-
     /// Filter: only forward notifications from specific apps (comma-separated)
     #[arg(long)]
     filter_apps: Option<String>,
@@ -1696,7 +1692,6 @@ struct AsyncMessageHandler {
     protobuf_request_id: Arc<Mutex<u16>>,
     notification_handler: Arc<Mutex<Option<Arc<GarminNotificationHandler>>>>,
     pairing_detected: Arc<Mutex<bool>>,
-    skip_pairing: bool,
     message_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
     send_semaphore: Arc<Semaphore>,
     watchdog: Arc<Mutex<Option<Arc<WatchdogManager>>>>,
@@ -1710,14 +1705,13 @@ struct AsyncMessageHandler {
 const MAX_PROTOBUF_CHUNK_SIZE: usize = 375;
 
 impl AsyncMessageHandler {
-    fn new(skip_pairing: bool) -> Self {
+    fn new() -> Self {
         let handler = Self {
             communicator: Arc::new(Mutex::new(None)),
             initialization_complete: Arc::new(Mutex::new(false)),
             protobuf_request_id: Arc::new(Mutex::new(1)),
             notification_handler: Arc::new(Mutex::new(None)),
             pairing_detected: Arc::new(Mutex::new(false)),
-            skip_pairing,
             message_queue: Arc::new(Mutex::new(VecDeque::new())),
             send_semaphore: Arc::new(Semaphore::new(1)),
             data_transfer_handler: Arc::new(DataTransferHandler::new()),
@@ -2086,137 +2080,51 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                         }
 
                         // Check if we should skip full initialization
-                        if self.skip_pairing {
-                            println!(
-                                "   ℹ️  Skip pairing mode - sending minimal essential messages"
-                            );
+                        println!("   ℹ️  Skip pairing mode - sending minimal essential messages");
 
-                            // FIRST: Send Configuration proactively to advertise HTTP capabilities
-                            println!("   📤 Sending Configuration proactively to advertise HTTP capabilities");
-                            match MessageGenerator::configuration_response() {
-                                Ok(msg) => {
-                                    self.send_response(&msg).await?;
-                                    println!(
-                                        "      ✅ Configuration with HTTP capability #10 sent!"
-                                    );
-                                }
-                                Err(e) => eprintln!("      ❌ Failed to send Configuration: {}", e),
+                        // FIRST: Send Configuration proactively to advertise HTTP capabilities
+                        println!("   📤 Sending Configuration proactively to advertise HTTP capabilities");
+                        match MessageGenerator::configuration_response() {
+                            Ok(msg) => {
+                                self.send_response(&msg).await?;
+                                println!("      ✅ Configuration with HTTP capability #10 sent!");
                             }
+                            Err(e) => eprintln!("      ❌ Failed to send Configuration: {}", e),
+                        }
 
-                            // Send device settings to enable notifications on watch
-                            println!("   📤 Sending SetDeviceSettings (enable notifications)");
-                            match MessageGenerator::set_device_settings(true, true, false) {
-                                Ok(msg) => {
-                                    self.send_response(&msg).await?;
-                                    println!("      ✅ SetDeviceSettings sent");
-                                }
-                                Err(e) => {
-                                    eprintln!("      ❌ Failed to send SetDeviceSettings: {}", e)
-                                }
+                        // Send device settings to enable notifications on watch
+                        println!("   📤 Sending SetDeviceSettings (enable notifications)");
+                        match MessageGenerator::set_device_settings(true, true, false) {
+                            Ok(msg) => {
+                                self.send_response(&msg).await?;
+                                println!("      ✅ SetDeviceSettings sent");
                             }
-
-                            // Send SYNC_READY to indicate we're ready to sync
-                            println!("   📤 Sending SYNC_READY event");
-                            match MessageGenerator::system_event(8, 0) {
-                                Ok(msg) => {
-                                    self.send_response(&msg).await?;
-                                    println!("      ✅ SYNC_READY sent");
-                                }
-                                Err(e) => eprintln!("      ❌ Failed to send SYNC_READY: {}", e),
+                            Err(e) => {
+                                eprintln!("      ❌ Failed to send SetDeviceSettings: {}", e)
                             }
+                        }
 
-                            // Send HOST_DID_ENTER_FOREGROUND to trigger notification subscription
-                            println!("   📤 Sending HOST_DID_ENTER_FOREGROUND");
-                            match MessageGenerator::system_event(6, 0) {
-                                Ok(msg) => {
-                                    self.send_response(&msg).await?;
-                                    println!("      ✅ HOST_DID_ENTER_FOREGROUND sent");
-                                }
-                                Err(e) => eprintln!(
-                                    "      ❌ Failed to send HOST_DID_ENTER_FOREGROUND: {}",
-                                    e
-                                ),
+                        // Send SYNC_READY to indicate we're ready to sync
+                        println!("   📤 Sending SYNC_READY event");
+                        match MessageGenerator::system_event(8, 0) {
+                            Ok(msg) => {
+                                self.send_response(&msg).await?;
+                                println!("      ✅ SYNC_READY sent");
                             }
+                            Err(e) => eprintln!("      ❌ Failed to send SYNC_READY: {}", e),
+                        }
 
-                            println!("   ✅ Minimal initialization complete - watch should now subscribe to notifications");
-                        } else {
-                            // After Configuration, send initialization messages (matching Java completeInitialization)
-                            println!("   📤 Sending initialization messages...");
-
-                            // 0. FIRST: Send Configuration proactively to advertise capabilities
-                            println!("      ⚡ Sending Configuration proactively to advertise HTTP capabilities");
-                            match MessageGenerator::configuration_response() {
-                                Ok(msg) => {
-                                    println!(
-                                        "      ✅ Sending Configuration with HTTP capability #10"
-                                    );
-                                    self.send_response(&msg).await?;
-                                    println!("      ✅ Configuration sent proactively!");
-                                }
-                                Err(e) => eprintln!("      ❌ Failed to send Configuration: {}", e),
+                        // Send HOST_DID_ENTER_FOREGROUND to trigger notification subscription
+                        println!("   📤 Sending HOST_DID_ENTER_FOREGROUND");
+                        match MessageGenerator::system_event(6, 0) {
+                            Ok(msg) => {
+                                self.send_response(&msg).await?;
+                                println!("      ✅ HOST_DID_ENTER_FOREGROUND sent");
                             }
-
-                            // 1. Request supported file types
-                            match MessageGenerator::supported_file_types_request() {
-                                Ok(msg) => {
-                                    println!("      ✅ Sending SupportedFileTypesRequest");
-                                    self.send_response(&msg).await?;
-                                }
-                                Err(e) => eprintln!(
-                                    "      ❌ Failed to send SupportedFileTypesRequest: {}",
-                                    e
-                                ),
-                            }
-
-                            // 2. Send device settings
-                            match MessageGenerator::set_device_settings(true, true, false) {
-                                Ok(msg) => {
-                                    println!("      ✅ Sending SetDeviceSettings");
-                                    self.send_response(&msg).await?;
-                                }
-                                Err(e) => {
-                                    eprintln!("      ❌ Failed to send SetDeviceSettings: {}", e)
-                                }
-                            }
-
-                            // 3. Send SYNC_READY event (event type 8)
-                            match MessageGenerator::system_event(8, 0) {
-                                Ok(msg) => {
-                                    println!("      ✅ Sending SYNC_READY event");
-                                    self.send_response(&msg).await?;
-                                }
-                                Err(e) => eprintln!("      ❌ Failed to send SYNC_READY: {}", e),
-                            }
-
-                            // 4. Enable battery level updates (ProtobufRequest)
-                            let request_id = self.get_next_protobuf_request_id();
-                            match MessageGenerator::protobuf_battery_status_request(request_id) {
-                                Ok(msg) => {
-                                    println!(
-                                        "      ✅ Sending battery status request (request_id={})",
-                                        request_id
-                                    );
-                                    self.send_response(&msg).await?;
-                                }
-                                Err(e) => eprintln!(
-                                    "      ❌ Failed to send battery status request: {}",
-                                    e
-                                ),
-                            }
-
-                            // 5. Send HOST_DID_ENTER_FOREGROUND event (event type 6)
-                            match MessageGenerator::system_event(6, 0) {
-                                Ok(msg) => {
-                                    println!("      ✅ Sending HOST_DID_ENTER_FOREGROUND event");
-                                    self.send_response(&msg).await?;
-                                }
-                                Err(e) => eprintln!(
-                                    "      ❌ Failed to send HOST_DID_ENTER_FOREGROUND: {}",
-                                    e
-                                ),
-                            }
-
-                            println!("   ✅ Initialization messages sent!");
+                            Err(e) => eprintln!(
+                                "      ❌ Failed to send HOST_DID_ENTER_FOREGROUND: {}",
+                                e
+                            ),
                         }
 
                         // Mark initialization as complete (even if we skipped sending messages)
@@ -2230,10 +2138,7 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                             }
                         };
 
-                        // On first connect, send SYNC_COMPLETE after initialization
-                        // Skip this for reconnects to already-paired watches or if skip_pairing is true
-
-                        if is_first_connect && !self.skip_pairing {
+                        if is_first_connect {
                             println!("   🎉 First connect - sending SYNC_COMPLETE");
                             match MessageGenerator::system_event(0, 0) {
                                 Ok(msg) => {
@@ -2243,6 +2148,8 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                                 Err(e) => eprintln!("      ❌ Failed to send SYNC_COMPLETE: {}", e),
                             }
                         }
+
+                        println!("   ✅ Minimal initialization complete - watch should now subscribe to notifications");
                     }
                     garmin_v2_communicator::GfdiMessage::CurrentTimeRequest => {
                         println!("📱 Received CurrentTimeRequest");
@@ -4204,7 +4111,6 @@ async fn connect_to_watch(
     adapter: &Adapter,
     mac_address: &str,
     watchdog: Arc<WatchdogManager>,
-    skip_pairing: bool,
     async_handler: &Arc<AsyncMessageHandler>,
 ) -> std::result::Result<WatchConnection, Box<dyn std::error::Error>> {
     println!("\n🔌 Connecting to watch {}...", mac_address);
@@ -4318,46 +4224,6 @@ async fn connect_to_watch(
     println!("   ✅ MLR registration should be complete");
 
     // Handle pairing if needed
-    if !skip_pairing {
-        println!("\n7️⃣  Waiting for pairing sequence...");
-        println!("   ℹ️  Watch will send configuration messages");
-        println!("\n   ⏳ Monitoring for Configuration message...");
-
-        let start = std::time::Instant::now();
-        let timeout = Duration::from_secs(8);
-        let mut config_received = false;
-        let mut last_check = start;
-
-        while start.elapsed() < timeout {
-            if async_handler.is_paired() {
-                config_received = true;
-                println!("   ✅ Configuration received - pairing complete!");
-                println!(
-                    "   ⏱️  Took {:.1}s to detect",
-                    start.elapsed().as_secs_f32()
-                );
-                break;
-            }
-
-            if last_check.elapsed() >= Duration::from_secs(1) {
-                println!(
-                    "   ⏳ Still waiting... ({:.0}s elapsed)",
-                    start.elapsed().as_secs_f32()
-                );
-                last_check = std::time::Instant::now();
-            }
-
-            sleep(Duration::from_millis(100)).await;
-        }
-
-        if !config_received {
-            println!("   ⚠️  Configuration not received within timeout");
-            println!("   ℹ️  Continuing anyway - device may already be paired");
-        }
-    } else {
-        println!("\n7️⃣  Skip pairing flag set - going straight to notifications");
-    }
-
     println!("\n✅ Watch connection fully established!\n");
 
     Ok(WatchConnection {
@@ -4425,7 +4291,27 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                 }
             }
 
-            // Second try: Use adapter API to power on
+            // Second try: Use bluetoothctl to unblock Bluetooth
+            debug!("   🔧 Attempting: bluetoothctl power on");
+            match std::process::Command::new("bluetoothctl")
+                .args(&["power", "on"])
+                .output()
+            {
+                Ok(output) => {
+                    if output.status.success() {
+                        info!("   ✅ bluetoothctl power on succeeded");
+                        sleep(Duration::from_secs(5)).await;
+                    } else {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        error!("   ⚠️  bluetoothctl command failed: {}", stderr);
+                    }
+                }
+                Err(e) => {
+                    error!("   ⚠️  Could not run bluetoothctl: {}", e);
+                }
+            }
+
+            // Third try: Use adapter API to power on
             match adapter.set_powered(true).await {
                 Ok(_) => {
                     // Wait a moment for adapter to fully power on
@@ -4475,7 +4361,7 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
     let mut communicator = CommunicatorV2::new(ble_arc.clone());
 
     // Set up async message handler BEFORE initialization
-    let async_handler = Arc::new(AsyncMessageHandler::new(args.skip_pairing));
+    let async_handler = Arc::new(AsyncMessageHandler::new());
     communicator.set_async_message_callback(async_handler.clone());
 
     // Initialize calendar manager early if calendar sync is enabled
@@ -4567,7 +4453,6 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
         &adapter,
         &args.mac_address,
         watchdog.clone(),
-        args.skip_pairing,
         &async_handler,
     )
     .await?;
@@ -4896,13 +4781,43 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                                         .output()
                                     {
                                         if !output.status.success() {
-                                            eprintln!("   ⚠️  rfkill failed");
+                                            error!("   ⚠️  rfkill failed");
+                                            sleep(Duration::from_secs(120)).await;
+                                            continue;
                                         }
                                     }
+
+                                    sleep(Duration::from_secs(1)).await;
+
+                                    // Second try: Use bluetoothctl to unblock Bluetooth
+                                    debug!("   🔧 Attempting: bluetoothctl power on");
+                                    match std::process::Command::new("bluetoothctl")
+                                        .args(&["power", "on"])
+                                        .output()
+                                    {
+                                        Ok(output) => {
+                                            if output.status.success() {
+                                                info!("   ✅ bluetoothctl power on succeeded");
+                                            } else {
+                                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                                error!("   ⚠️  bluetoothctl command failed: {}", stderr);
+                                                sleep(Duration::from_secs(120)).await;
+                                                continue;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("   ⚠️  Could not run bluetoothctl: {}", e);
+                                            sleep(Duration::from_secs(120)).await;
+                                            continue;
+                                        }
+                                    }
+
                                     sleep(Duration::from_secs(5)).await;
                                 }
                                 Err(e) => {
-                                    eprintln!("   ⚠️  Could not check Bluetooth power: {}", e);
+                                    error!("   ⚠️  Could not check Bluetooth power: {}", e);
+                                    sleep(Duration::from_secs(120)).await;
+                                    continue;
                                 }
                                 _ => {}
                             }
@@ -4913,7 +4828,6 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                                     &adapter,
                                     &args.mac_address,
                                     watchdog.clone(),
-                                    args.skip_pairing,
                                     &async_handler,
                                 )
                                 .await

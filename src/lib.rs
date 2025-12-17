@@ -16,6 +16,7 @@ pub mod cobs;
 pub mod communicator;
 pub mod data_transfer;
 pub mod fit;
+pub mod garmin_json;
 pub mod http;
 pub mod messages;
 pub mod mlr;

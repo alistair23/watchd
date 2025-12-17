@@ -959,6 +959,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "garmin-v2-communicator"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum 0.7.9",
+ "bluer",
+ "bytes",
+ "chrono",
+ "clap",
+ "console-subscriber",
+ "env_logger",
+ "flate2",
+ "futures",
+ "log",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "uuid",
+ "zbus",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2097,6 +2121,7 @@ version = "1.0.145"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "402a6f66d8c709116cf22f558eab210f5a50187f702eb4d7e5ef38d9a7f1c79c"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "ryu",
@@ -2732,30 +2757,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76f218a38c84bcb33c25ec7059b07847d465ce0e0a76b995e134a45adcb6af76"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "watchd"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum 0.7.9",
- "bluer",
- "bytes",
- "chrono",
- "clap",
- "console-subscriber",
- "env_logger",
- "flate2",
- "futures",
- "log",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "uuid",
- "zbus",
 ]
 
 [[package]]
