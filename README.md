@@ -24,6 +24,8 @@ The following key features are supported
  - Long running dameon application that attempts to reconnect to the watch
      - Should also replay notifications missed while attempting to reconnect
 
+Note that unlike GadgetBridge all HTTP requests are sent, which includes requests to the Garmin servers.
+
 ## Installation
 
 TODO
@@ -33,5 +35,5 @@ TODO
 TODO
 
 ```shell
-CALENDAR_URLS="https://domain.com/mycal.ics" cargo run --example notification_dbus_monitor -- AB:CD:EF:01:23:45 --enable-dedup --skip-pairing --enable-calendar-sync
+CALENDAR_URLS="https://domain.com/mycal.ics" cargo run --example notification_dbus_monitor -- AB:CD:EF:01:23:45 --enable-dedup --enable-calendar-sync
 ```
