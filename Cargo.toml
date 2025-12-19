@@ -24,11 +24,7 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 zbus = { version = "4.0", default-features = false, features = ["tokio"] }
 reqwest = { version = "0.11", features = ["json", "blocking"] }
 flate2 = "1.0"
-
-[dev-dependencies]
 env_logger = "0.11"
-tokio = { version = "1.0", features = ["full", "test-util"] }
 
-[lib]
-name = "garmin_v2_communicator"
-path = "src/lib.rs"
+[[bin]]
+name = "watchd"

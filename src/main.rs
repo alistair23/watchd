@@ -1,38 +1,55 @@
-//! DBus Notification Monitor for Garmin v2 Communicator
+//! Garmin v2 BLE Communication Protocol
 //!
-//! This example runs a long-lived monitor that listens to system DBus notifications
-//! and forwards them to a connected Garmin watch.
+//! This library provides a Rust implementation of the Garmin v2 Bluetooth Low Energy
+//! communication protocol, including COBS encoding/decoding and the Multi-Link Reliable (MLR)
+//! protocol for reliable message transmission.
 //!
-//! Usage:
-//!   cargo run --example notification_dbus_monitor -- <BLUETOOTH_MAC_ADDRESS>
-//!   cargo run --example notification_dbus_monitor -- AA:BB:CC:DD:EE:FF
+//! # Modules
 //!
-//! This will monitor all desktop notifications (from any app) and forward them
-//! to your Garmin watch automatically.
-//!
-//! Requirements:
-//! - Linux with BlueZ and DBus
-//! - Bluetooth adapter
-//! - Garmin device MAC address
-//! - Desktop environment with notification daemon (GNOME, KDE, etc.)
+//! - `cobs`: COBS (Consistent Overhead Byte Stuffing) encoding and decoding
+//! - `mlr`: Multi-Link Reliable protocol implementation
+//! - `communicator`: High-level Garmin v2 communicator interface
+//! - `types`: Common types and enums used throughout the library
+
+pub mod calendar;
+pub mod cobs;
+pub mod communicator;
+pub mod data_transfer;
+pub mod garmin_json;
+pub mod garmin_weather_api;
+pub mod http;
+pub mod messages;
+pub mod mlr;
+pub mod protobuf_calendar;
+pub mod types;
+pub mod watchdog;
+pub mod weather;
+pub mod weather_bom;
+pub mod weather_provider;
 
 use bluer::{gatt::remote::Characteristic, Adapter, Address, Device, Session};
+use calendar::CalendarManager;
 use clap::Parser;
-use futures::stream::StreamExt;
-use garmin_v2_communicator::weather_provider::{UnifiedWeatherProvider, WeatherProviderType};
-use garmin_v2_communicator::{
-    encode_calendar_response, handle_calendar_request, handle_http_request_with_weather,
-    parse_calendar_request, AsyncGfdiMessageCallback, BleSupport, CalendarManager,
-    CalendarResponseStatus, CharacteristicHandle, CommunicatorV2, DataTransferHandler,
-    HealthStatus, HttpRequest, MessageGenerator, MessageParser, Transaction, WatchdogConfig,
-    WatchdogManager,
+use communicator::{
+    AsyncGfdiMessageCallback, BleSupport, CharacteristicHandle, CommunicatorV2, Transaction,
 };
+use data_transfer::DataTransferHandler;
+use futures::stream::StreamExt;
+use http::{handle_http_request_with_weather, HttpRequest};
 use log::{debug, error, info};
+use messages::{GfdiMessage, MessageGenerator, MessageParser};
+use protobuf_calendar::{
+    encode_calendar_response, handle_calendar_request, parse_calendar_request,
+    CalendarResponseStatus,
+};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
+use types::GarminError;
+use watchdog::{HealthStatus, WatchdogConfig, WatchdogManager};
+use weather_provider::{UnifiedWeatherProvider, WeatherProviderType};
 use zbus::{message::Message, Connection};
 
 /// Helper function to format bytes as hex for debugging
@@ -504,10 +521,7 @@ impl GarminNotificationHandler {
     }
 
     /// Remove a notification from the watch
-    pub async fn remove_notification(
-        &self,
-        notification_id: i32,
-    ) -> garmin_v2_communicator::Result<()> {
+    pub async fn remove_notification(&self, notification_id: i32) -> types::Result<()> {
         println!(
             "🗑️  Removing notification ID {} from watch",
             notification_id
@@ -548,10 +562,7 @@ impl GarminNotificationHandler {
     }
 
     /// Send a generic notification (SMS, email, chat, etc.)
-    pub async fn on_notification(
-        &self,
-        notification: NotificationSpec,
-    ) -> garmin_v2_communicator::Result<()> {
+    pub async fn on_notification(&self, notification: NotificationSpec) -> types::Result<()> {
         // Check if connected
         let is_connected = *self.is_connected.lock().unwrap();
 
@@ -789,7 +800,7 @@ impl GarminNotificationHandler {
     }
 
     /// Replay all missed notifications
-    pub async fn replay_missed_notifications(&self) -> garmin_v2_communicator::Result<()> {
+    pub async fn replay_missed_notifications(&self) -> types::Result<()> {
         let notifications: Vec<NotificationSpec> = {
             let mut missed = self.missed_notifications.lock().unwrap();
             let notifications: Vec<_> = missed.drain(..).collect();
@@ -837,7 +848,7 @@ impl GarminNotificationHandler {
         notification_id: i32,
         command: u8,
         attributes: &[(u8, u16)],
-    ) -> garmin_v2_communicator::Result<()> {
+    ) -> types::Result<()> {
         println!(
             "📱 Handling NotificationControl: ID={}, Command={}",
             notification_id, command
@@ -1188,7 +1199,7 @@ impl GarminNotificationHandler {
         &self,
         id: i32,
         notification_type: NotificationType,
-    ) -> garmin_v2_communicator::Result<()> {
+    ) -> types::Result<()> {
         println!("🗑️  Deleting notification (ID: {})", id);
 
         // Update notification count for this type
@@ -1239,10 +1250,7 @@ impl GarminNotificationHandler {
         Ok(())
     }
 
-    pub async fn on_set_call_state(
-        &self,
-        call_spec: CallSpec,
-    ) -> garmin_v2_communicator::Result<()> {
+    pub async fn on_set_call_state(&self, call_spec: CallSpec) -> types::Result<()> {
         let id = call_spec.get_id();
 
         match call_spec.command {
@@ -1605,10 +1613,7 @@ impl BleSupport for BlueRSupport {
         }
     }
 
-    fn enable_notifications(
-        &self,
-        _handle: &CharacteristicHandle,
-    ) -> garmin_v2_communicator::Result<()> {
+    fn enable_notifications(&self, _handle: &CharacteristicHandle) -> types::Result<()> {
         // Notifications will be enabled asynchronously
         Ok(())
     }
@@ -1617,7 +1622,7 @@ impl BleSupport for BlueRSupport {
         &self,
         handle: &CharacteristicHandle,
         data: &[u8],
-    ) -> garmin_v2_communicator::Result<()> {
+    ) -> types::Result<()> {
         debug!(
             "📤 BLE WRITE: {} bytes to characteristic {}",
             data.len(),
@@ -1636,22 +1641,20 @@ impl BleSupport for BlueRSupport {
         if let Some(characteristic) = characteristic {
             let _result = characteristic.write(&data).await.map_err(|e| {
                 error!("   ❌ BLE write failed: {}", e);
-                garmin_v2_communicator::GarminError::BluetoothError(format!(
-                    "Failed to write: {}",
-                    e
-                ))
+                crate::GarminError::BluetoothError(format!("Failed to write: {}", e))
             })?;
             debug!("   ✅ BLE write completed successfully");
             Ok(())
         } else {
             error!("   ❌ Characteristic {} not found", handle.uuid);
-            Err(garmin_v2_communicator::GarminError::BluetoothError(
-                format!("Characteristic {} not found", handle.uuid),
-            ))
+            Err(crate::GarminError::BluetoothError(format!(
+                "Characteristic {} not found",
+                handle.uuid
+            )))
         }
     }
 
-    fn create_transaction(&self, _name: &str) -> Box<dyn garmin_v2_communicator::Transaction> {
+    fn create_transaction(&self, _name: &str) -> Box<dyn crate::Transaction> {
         Box::new(BlueRTransaction)
     }
 }
@@ -1667,7 +1670,7 @@ impl Transaction for BlueRTransaction {
         // Transaction not implemented for real BLE
     }
 
-    fn queue(self: Box<Self>) -> garmin_v2_communicator::Result<()> {
+    fn queue(self: Box<Self>) -> types::Result<()> {
         Ok(())
     }
 }
@@ -1788,7 +1791,7 @@ impl AsyncMessageHandler {
 
     /// Send a protobuf response, chunking it if necessary
     /// This handles large protobuf messages that exceed MAX_PROTOBUF_CHUNK_SIZE
-    async fn send_protobuf_response(&self, message: Vec<u8>) -> garmin_v2_communicator::Result<()> {
+    async fn send_protobuf_response(&self, message: Vec<u8>) -> types::Result<()> {
         // Parse the message to extract protobuf payload
         if message.len() < 18 {
             // Message too small to be a valid ProtobufResponse, send as-is
@@ -1854,7 +1857,7 @@ impl AsyncMessageHandler {
         data_offset: u32,
         chunk_data: &[u8],
         total_length: usize,
-    ) -> garmin_v2_communicator::Result<()> {
+    ) -> types::Result<()> {
         println!("   📤 Sending protobuf chunk:");
         println!("      Request ID: {}", request_id);
         println!("      Offset: {}", data_offset);
@@ -1914,7 +1917,7 @@ impl AsyncMessageHandler {
         &self,
         request_id: u16,
         data_offset: u32,
-    ) -> garmin_v2_communicator::Result<()> {
+    ) -> types::Result<()> {
         let pending_chunk = {
             let pending = self.pending_protobuf_chunks.lock().unwrap();
             pending.get(&request_id).cloned()
@@ -1996,7 +1999,7 @@ impl AsyncMessageHandler {
         Ok(())
     }
 
-    async fn send_response(&self, response: &[u8]) -> garmin_v2_communicator::Result<()> {
+    async fn send_response(&self, response: &[u8]) -> types::Result<()> {
         let mut queue = self.message_queue.lock().unwrap();
         queue.push_back(response.to_vec());
 
@@ -2006,7 +2009,7 @@ impl AsyncMessageHandler {
 
 #[async_trait::async_trait]
 impl AsyncGfdiMessageCallback for AsyncMessageHandler {
-    async fn on_message(&self, message: &[u8]) -> garmin_v2_communicator::Result<Option<Vec<u8>>> {
+    async fn on_message(&self, message: &[u8]) -> types::Result<Option<Vec<u8>>> {
         // Record RX traffic for watchdog
         let watchdog = self.watchdog.lock().unwrap().as_ref().cloned();
         if let Some(wd) = watchdog {
@@ -2020,7 +2023,7 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
         match MessageParser::parse(message) {
             Ok(parsed_message) => {
                 match parsed_message {
-                    garmin_v2_communicator::GfdiMessage::DeviceInformation(dev_info) => {
+                    crate::GfdiMessage::DeviceInformation(dev_info) => {
                         println!("📱 Received DeviceInformation:");
                         println!("   Protocol: {}", dev_info.protocol_version);
                         println!("   Product: {}", dev_info.product_number);
@@ -2042,7 +2045,7 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                             }
                         }
                     }
-                    garmin_v2_communicator::GfdiMessage::Configuration(config) => {
+                    crate::GfdiMessage::Configuration(config) => {
                         println!(
                             "📱 Received Configuration with {} capabilities",
                             config.capabilities.len()
@@ -2148,7 +2151,7 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
 
                         println!("   ✅ Minimal initialization complete - watch should now subscribe to notifications");
                     }
-                    garmin_v2_communicator::GfdiMessage::CurrentTimeRequest => {
+                    crate::GfdiMessage::CurrentTimeRequest => {
                         println!("📱 Received CurrentTimeRequest");
 
                         match MessageGenerator::current_time_response() {
@@ -2162,7 +2165,7 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                             }
                         }
                     }
-                    garmin_v2_communicator::GfdiMessage::NotificationControl(ctrl) => {
+                    crate::GfdiMessage::NotificationControl(ctrl) => {
                         println!(
                             "📱 Received NotificationControl: ID={}, Command={}",
                             ctrl.notification_id, ctrl.command
@@ -2225,7 +2228,7 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                             eprintln!("   ❌ Notification handler not available");
                         }
                     }
-                    garmin_v2_communicator::GfdiMessage::NotificationSubscription(sub) => {
+                    crate::GfdiMessage::NotificationSubscription(sub) => {
                         println!("📱 Received NotificationSubscription:");
                         println!("   Enable: {}", sub.enable);
                         println!("   Unknown: {}", sub.unk);
@@ -2242,7 +2245,7 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                             }
                         }
                     }
-                    garmin_v2_communicator::GfdiMessage::Synchronization(sync_msg) => {
+                    crate::GfdiMessage::Synchronization(sync_msg) => {
                         println!("📱 Received Synchronization:");
                         println!("   Type: {}", sync_msg.synchronization_type);
                         println!("   Bitmask: 0x{:016X}", sync_msg.file_type_bitmask);
@@ -2274,12 +2277,12 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                             }
                         }
                     }
-                    garmin_v2_communicator::GfdiMessage::FilterStatus(filter_status) => {
+                    crate::GfdiMessage::FilterStatus(filter_status) => {
                         println!("📱 Received FilterStatus:");
                         println!("   Status: {:?}", filter_status.status);
                         println!("   Filter type: {}", filter_status.filter_type);
                     }
-                    garmin_v2_communicator::GfdiMessage::WeatherRequest(weather_req) => {
+                    crate::GfdiMessage::WeatherRequest(weather_req) => {
                         let lat_deg = weather_req.latitude as f64 / 11930464.7111;
                         let lon_deg = weather_req.longitude as f64 / 11930464.7111;
 
@@ -2308,7 +2311,7 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                             }
                         }
                     }
-                    garmin_v2_communicator::GfdiMessage::Unknown { message_id, data } => {
+                    crate::GfdiMessage::Unknown { message_id, data } => {
                         println!("📱 Received UNKNOWN message: ID=0x{:04X}", message_id);
                         println!("   Data: {}", hex_dump(&data, 32));
 
@@ -4041,8 +4044,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .filter_module("zbus::connection::socket_reader", log::LevelFilter::Warn)
         .init();
 
-    // console_subscriber::init();
-
     let args = Args::parse();
 
     println!("🚀 Garmin DBus Notification Monitor with Watchdog\n");
@@ -4412,7 +4413,7 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                     }
                     Err(_) => {
                         // No local providers available, try just URL provider
-                        use garmin_v2_communicator::calendar::UrlCalendarProvider;
+                        use crate::calendar::UrlCalendarProvider;
                         match UrlCalendarProvider::new(urls, args.calendar_cache_duration) {
                             Ok(provider) => {
                                 match CalendarManager::with_providers(vec![Box::new(provider)]) {
