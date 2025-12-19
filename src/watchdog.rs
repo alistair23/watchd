@@ -238,6 +238,10 @@ impl WatchdogManager {
         let mut state = self.state.lock().await;
         let now = Instant::now();
 
+        if state.health_status == HealthStatus::Disconnected {
+            return HealthStatus::Disconnected;
+        }
+
         // Check RX timeout
         if let Some(last_rx) = state.last_rx {
             let rx_elapsed = now.duration_since(last_rx);

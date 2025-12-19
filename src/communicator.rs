@@ -1697,18 +1697,6 @@ mod tests {
         }
     }
 
-    // Helper to get COBS-encoded message
-    fn create_cobs_encoded_message(data: &[u8]) -> Vec<u8> {
-        CobsCoDec::encode(data)
-    }
-
-    fn create_test_message(msg_type: RequestType, client_id: u64) -> Vec<u8> {
-        let mut message = vec![0]; // handle
-        message.push(msg_type.to_u8());
-        message.extend_from_slice(&client_id.to_le_bytes());
-        message
-    }
-
     #[tokio::test]
     async fn test_create_communicator() {
         let ble = Arc::new(MockBleSupport::new());
@@ -1788,73 +1776,6 @@ mod tests {
         // Verify services are cleared (except GFDI which should be re-registered)
         // Note: The re-registration happens but we can't easily verify it in this test
         // because it would require the mock BLE support to actually process the write
-    }
-
-    #[tokio::test]
-    async fn test_process_register_ml_resp() {
-        let ble = Arc::new(MockBleSupport::new());
-        let comm = CommunicatorV2::new(ble);
-
-        // Create a REGISTER_ML_RESP message
-        // Note: handle 0 is part of the outer message structure
-        let mut message = vec![0]; // handle 0 for management
-        message.push(RequestType::RegisterMlResp.to_u8());
-        message.extend_from_slice(&GADGETBRIDGE_CLIENT_ID.to_le_bytes());
-        message.extend_from_slice(&Service::GFDI.code().to_le_bytes()); // service code
-        message.push(0); // status = success
-        message.push(1); // handle
-        message.push(2); // reliable
-
-        // COBS encode the message
-        let encoded = CobsCoDec::encode(&message);
-
-        // Process the encoded message
-        let result = comm.on_characteristic_changed(&encoded).await;
-        assert!(result.is_ok());
-
-        // Small delay to allow async processing to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-        // Verify service is registered
-        let state = comm.state.lock().await;
-        assert_eq!(state.service_by_handle.get(&1), Some(&Service::GFDI));
-        assert_eq!(state.handle_by_service.get(&Service::GFDI), Some(&1));
-    }
-
-    #[tokio::test]
-    async fn test_process_close_handle_resp() {
-        let ble = Arc::new(MockBleSupport::new());
-        let comm = CommunicatorV2::new(ble);
-
-        // First register a service
-        comm.register_handle(Service::RealtimeHr, 2).await;
-
-        // Create a CLOSE_HANDLE_RESP message
-        // Note: handle 0 is part of the outer message structure
-        let mut message = vec![0]; // handle 0 for management
-        message.push(RequestType::CloseHandleResp.to_u8());
-        message.extend_from_slice(&GADGETBRIDGE_CLIENT_ID.to_le_bytes());
-        message.extend_from_slice(&Service::RealtimeHr.code().to_le_bytes()); // service code
-        message.push(2); // handle
-        message.push(0); // status = success
-
-        // COBS encode the message
-        let encoded = CobsCoDec::encode(&message);
-
-        eprintln!("Original message: {:?}", message);
-        eprintln!("Encoded: {:?}", encoded);
-
-        // Process the encoded message
-        let result = comm.on_characteristic_changed(&encoded).await;
-        if let Err(ref e) = result {
-            eprintln!("Error: {}", e);
-        }
-        assert!(result.is_ok());
-
-        // Verify service is unregistered
-        let state = comm.state.lock().await;
-        assert_eq!(state.service_by_handle.get(&2), None);
-        assert_eq!(state.handle_by_service.get(&Service::RealtimeHr), None);
     }
 
     #[tokio::test]

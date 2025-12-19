@@ -19,11 +19,13 @@
 use bluer::{gatt::remote::Characteristic, Adapter, Address, Device, Session};
 use clap::Parser;
 use futures::stream::StreamExt;
+use garmin_v2_communicator::weather_provider::{UnifiedWeatherProvider, WeatherProviderType};
 use garmin_v2_communicator::{
-    encode_calendar_response, handle_calendar_request, handle_http_request, parse_calendar_request,
-    AsyncGfdiMessageCallback, BleSupport, CalendarManager, CalendarResponseStatus,
-    CharacteristicHandle, CommunicatorV2, DataTransferHandler, HealthStatus, HttpRequest,
-    MessageGenerator, MessageParser, Transaction, WatchdogConfig, WatchdogManager,
+    encode_calendar_response, handle_calendar_request, handle_http_request_with_weather,
+    parse_calendar_request, AsyncGfdiMessageCallback, BleSupport, CalendarManager,
+    CalendarResponseStatus, CharacteristicHandle, CommunicatorV2, DataTransferHandler,
+    HealthStatus, HttpRequest, MessageGenerator, MessageParser, Transaction, WatchdogConfig,
+    WatchdogManager,
 };
 use log::{debug, error, info};
 use std::collections::{HashMap, VecDeque};
@@ -1689,7 +1691,6 @@ struct PendingProtobufChunk {
 struct AsyncMessageHandler {
     communicator: Arc<Mutex<Option<Arc<CommunicatorV2>>>>,
     initialization_complete: Arc<Mutex<bool>>,
-    protobuf_request_id: Arc<Mutex<u16>>,
     notification_handler: Arc<Mutex<Option<Arc<GarminNotificationHandler>>>>,
     pairing_detected: Arc<Mutex<bool>>,
     message_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
@@ -1699,6 +1700,7 @@ struct AsyncMessageHandler {
     calendar_manager: Arc<Mutex<Option<Arc<CalendarManager>>>>,
     /// Map of request_id -> pending protobuf chunks that need to be sent incrementally
     pending_protobuf_chunks: Arc<Mutex<HashMap<u16, PendingProtobufChunk>>>,
+    weather_provider: Arc<UnifiedWeatherProvider>,
 }
 
 /// Maximum protobuf data size per PROTOBUF_RESPONSE chunk (tested on Garmin devices)
@@ -1706,10 +1708,15 @@ const MAX_PROTOBUF_CHUNK_SIZE: usize = 375;
 
 impl AsyncMessageHandler {
     fn new() -> Self {
+        // Initialize BOM weather provider (no API key needed)
+        let weather_provider = Arc::new(UnifiedWeatherProvider::new(
+            WeatherProviderType::Bom,
+            Some(600), // Cache for 10 minutes
+        ));
+
         let handler = Self {
             communicator: Arc::new(Mutex::new(None)),
             initialization_complete: Arc::new(Mutex::new(false)),
-            protobuf_request_id: Arc::new(Mutex::new(1)),
             notification_handler: Arc::new(Mutex::new(None)),
             pairing_detected: Arc::new(Mutex::new(false)),
             message_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -1718,6 +1725,7 @@ impl AsyncMessageHandler {
             watchdog: Arc::new(Mutex::new(None)),
             calendar_manager: Arc::new(Mutex::new(None)),
             pending_protobuf_chunks: Arc::new(Mutex::new(HashMap::new())),
+            weather_provider,
         };
 
         // Start the message queue processor
@@ -1764,13 +1772,6 @@ impl AsyncMessageHandler {
         handler
     }
 
-    fn get_next_protobuf_request_id(&self) -> u16 {
-        let mut id = self.protobuf_request_id.lock().unwrap();
-        let current = *id as u16;
-        *id = id.wrapping_add(1);
-        current
-    }
-
     fn set_communicator(&self, comm: Arc<CommunicatorV2>) {
         *self.communicator.lock().unwrap() = Some(comm);
     }
@@ -1779,10 +1780,6 @@ impl AsyncMessageHandler {
         *self.notification_handler.lock().unwrap() = Some(handler.clone());
         // Also set watchdog reference
         *self.watchdog.lock().unwrap() = Some(handler.watchdog.clone());
-    }
-
-    fn is_paired(&self) -> bool {
-        *self.pairing_detected.lock().unwrap()
     }
 
     fn set_calendar_manager(&self, manager: Arc<CalendarManager>) {
@@ -2792,48 +2789,40 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                                                             http_request.path
                                                         );
 
-                                                        // Handle the request in a blocking task (HTTP I/O)
-                                                        match tokio::task::spawn_blocking(
-                                                            move || {
-                                                                let response = handle_http_request(
-                                                                    &http_request,
-                                                                );
-                                                                (response, http_request)
-                                                            },
-                                                        )
-                                                        .await
-                                                        {
-                                                            Ok((http_response, http_request)) => {
-                                                                println!(
-                                                                    "   ✅ HTTP Response: {}",
-                                                                    http_response.status
-                                                                );
+                                                        // Clone weather provider for the blocking task
+                                                        let weather_provider =
+                                                            self.weather_provider.clone();
 
-                                                                // Encode as ProtobufResponse
-                                                                match http_response
-                                                                    .encode_protobuf_response(
-                                                                    request_id,
-                                                                    &http_request,
-                                                                    Some(
-                                                                        &self.data_transfer_handler,
-                                                                    ),
-                                                                ) {
-                                                                    Ok(response) => {
-                                                                        println!("   ✅ Sending ProtobufResponse with HTTP data");
-                                                                        match self.send_protobuf_response(response).await {
+                                                        // Handle the request in a blocking task (HTTP I/O)
+                                                        let http_response =
+                                                            handle_http_request_with_weather(
+                                                                &http_request,
+                                                                Some(&weather_provider),
+                                                            )
+                                                            .await;
+                                                        println!(
+                                                            "   ✅ HTTP Response: {}",
+                                                            http_response.status
+                                                        );
+
+                                                        // Encode as ProtobufResponse
+                                                        match http_response
+                                                            .encode_protobuf_response(
+                                                                request_id,
+                                                                &http_request,
+                                                                Some(&self.data_transfer_handler),
+                                                            ) {
+                                                            Ok(response) => {
+                                                                println!("   ✅ Sending ProtobufResponse with HTTP data");
+                                                                match self.send_protobuf_response(response).await {
                                                                             Ok(_) => {
                                                                                 println!("   ✅ HTTP response sent successfully!")
                                                                             }
                                                                             Err(e) => eprintln!("   ❌ Failed to send HTTP response: {}", e),
                                                                         }
-                                                                    }
-                                                                    Err(e) => {
-                                                                        eprintln!("   ❌ Failed to encode HTTP response: {}", e);
-                                                                    }
-                                                                }
                                                             }
                                                             Err(e) => {
-                                                                eprintln!("   ❌ HTTP proxy task failed: {}", e);
+                                                                eprintln!("   ❌ Failed to encode HTTP response: {}", e);
                                                             }
                                                         }
                                                     }
@@ -3216,53 +3205,45 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                                                             field_number
                                                         );
 
-                                                        // Handle the request in a blocking task (HTTP I/O)
-                                                        match tokio::task::spawn_blocking(
-                                                            move || {
-                                                                let response = handle_http_request(
-                                                                    &http_request,
-                                                                );
-                                                                (response, http_request)
-                                                            },
-                                                        )
-                                                        .await
-                                                        {
-                                                            Ok((http_response, http_request)) => {
-                                                                println!(
-                                                                    "   ✅ HTTP Response: {}",
-                                                                    http_response.status
-                                                                );
+                                                        // Clone weather provider for the blocking task
+                                                        let weather_provider =
+                                                            self.weather_provider.clone();
 
-                                                                // Encode as ProtobufResponse
-                                                                match http_response
-                                                                    .encode_protobuf_response(
-                                                                    request_id,
-                                                                    &http_request,
-                                                                    Some(
-                                                                        &self.data_transfer_handler,
-                                                                    ),
-                                                                ) {
-                                                                    Ok(response) => {
-                                                                        println!("   ✅ Sending ProtobufResponse with HTTP data");
-                                                                        // Use chunking-aware send for protobuf responses
-                                                                        if let Err(e) = self
-                                                                            .send_protobuf_response(
-                                                                                response,
-                                                                            )
-                                                                            .await
-                                                                        {
-                                                                            eprintln!("   ❌ Failed to send HTTP response: {}", e);
-                                                                        } else {
-                                                                            println!("   ✅ HTTP response queued");
-                                                                        }
-                                                                    }
-                                                                    Err(e) => {
-                                                                        eprintln!("   ❌ Failed to encode HTTP response: {}", e);
-                                                                    }
+                                                        // Handle the request in a blocking task (HTTP I/O)
+                                                        let http_response =
+                                                            handle_http_request_with_weather(
+                                                                &http_request,
+                                                                Some(&weather_provider),
+                                                            )
+                                                            .await;
+                                                        println!(
+                                                            "   ✅ HTTP Response: {}",
+                                                            http_response.status
+                                                        );
+
+                                                        // Encode as ProtobufResponse
+                                                        match http_response
+                                                            .encode_protobuf_response(
+                                                                request_id,
+                                                                &http_request,
+                                                                Some(&self.data_transfer_handler),
+                                                            ) {
+                                                            Ok(response) => {
+                                                                println!("   ✅ Sending ProtobufResponse with HTTP data");
+                                                                // Use chunking-aware send for protobuf responses
+                                                                if let Err(e) = self
+                                                                    .send_protobuf_response(
+                                                                        response,
+                                                                    )
+                                                                    .await
+                                                                {
+                                                                    eprintln!("   ❌ Failed to send HTTP response: {}", e);
+                                                                } else {
+                                                                    println!("   ✅ HTTP response queued");
                                                                 }
                                                             }
                                                             Err(e) => {
-                                                                eprintln!("   ❌ HTTP proxy task failed: {}", e);
+                                                                eprintln!("   ❌ Failed to encode HTTP response: {}", e);
                                                             }
                                                         }
                                                     }
@@ -3759,6 +3740,7 @@ async fn handle_dbus_notification(
 async fn handle_modemmanager_call(
     msg: &zbus::Message,
     handler: &GarminNotificationHandler,
+    system_connection: &zbus::Connection,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Parse PropertiesChanged signal: "sa{sv}as"
     let (interface_name, changed_properties, _invalidated): (
@@ -3794,15 +3776,44 @@ async fn handle_modemmanager_call(
 
         if !calls.is_empty() {
             println!("📞 ModemManager: Incoming call detected!");
-            println!("   Call path: {}", calls[0].as_str());
+            let call_path = calls[0].as_str();
+            println!("   Call path: {}", call_path);
 
-            // Get call details from ModemManager
-            // For now, create a basic call notification
-            let call_spec = CallSpec::new(
-                "Unknown".to_string(), // Phone number - need to query ModemManager
-                CallCommand::Incoming,
-            )
-            .with_name("Incoming Call".to_string());
+            // Query ModemManager for call details (phone number)
+            let phone_number = match system_connection
+                .call_method(
+                    Some("org.freedesktop.ModemManager1"),
+                    call_path,
+                    Some("org.freedesktop.DBus.Properties"),
+                    "Get",
+                    &("org.freedesktop.ModemManager1.Call", "Number"),
+                )
+                .await
+            {
+                Ok(reply) => match reply.body().deserialize::<(zbus::zvariant::OwnedValue,)>() {
+                    Ok((number_variant,)) => match <&str>::try_from(&number_variant) {
+                        Ok(number) => {
+                            println!("   📱 Caller ID: {}", number);
+                            number.to_string()
+                        }
+                        Err(_) => {
+                            println!("   ⚠️  Could not parse phone number");
+                            "Unknown".to_string()
+                        }
+                    },
+                    Err(_) => {
+                        println!("   ⚠️  Could not get phone number from reply");
+                        "Unknown".to_string()
+                    }
+                },
+                Err(e) => {
+                    eprintln!("   ⚠️  Failed to query call number: {}", e);
+                    "Unknown".to_string()
+                }
+            };
+
+            let call_spec = CallSpec::new(phone_number.clone(), CallCommand::Incoming)
+                .with_name(phone_number.clone());
 
             println!("   📱 Sending incoming call notification to watch...");
             if let Err(e) = handler.on_set_call_state(call_spec).await {
@@ -4666,8 +4677,10 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                             && member == "PropertiesChanged"
                             && path.contains("ModemManager1/Modem") {
 
-                            if let Err(e) = handle_modemmanager_call(&msg, &handler_clone).await {
-                                eprintln!("⚠️  Error handling ModemManager call: {}", e);
+                            if let Some(ref sys_conn) = system_connection {
+                                if let Err(e) = handle_modemmanager_call(&msg, &handler_clone, sys_conn).await {
+                                    eprintln!("⚠️  Error handling ModemManager call: {}", e);
+                                }
                             }
                         }
                     }

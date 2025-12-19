@@ -15,14 +15,17 @@ pub mod calendar;
 pub mod cobs;
 pub mod communicator;
 pub mod data_transfer;
-pub mod fit;
 pub mod garmin_json;
+pub mod garmin_weather_api;
 pub mod http;
 pub mod messages;
 pub mod mlr;
 pub mod protobuf_calendar;
 pub mod types;
 pub mod watchdog;
+pub mod weather;
+pub mod weather_bom;
+pub mod weather_provider;
 
 pub use calendar::{CalendarError, CalendarEvent, CalendarManager, CalendarProvider};
 pub use cobs::CobsCoDec;
@@ -32,12 +35,7 @@ pub use communicator::{
     RealtimeStepsCallback, ServiceCallback, ServiceWriter, Transaction,
 };
 pub use data_transfer::{DataTransferHandler, TransferStats};
-pub use fit::{
-    calculate_crc, field_value, global_message, weather_field, FitDataMessage,
-    FitDefinitionMessage, FitError, FitFieldDefinition, FitFieldType, FitFileBuilder,
-    FitFileHeader,
-};
-pub use http::{handle_http_request, HttpMethod, HttpRequest, HttpResponse};
+pub use http::{handle_http_request_with_weather, HttpMethod, HttpRequest, HttpResponse};
 pub use messages::{
     ConfigurationMessage, DeviceInformationMessage, FilterStatusMessage, GfdiMessage,
     MessageGenerator, MessageId, MessageParser, NotificationControlMessage,

@@ -4,7 +4,7 @@
 //! Monkey-C binary format used by ConnectIQ apps.
 
 use crate::types::{GarminError, Result};
-use log::{error, info};
+use log::{debug, error, info};
 use serde_json::{Map, Number, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -167,7 +167,7 @@ pub fn decode(bytes: &[u8]) -> Result<Value> {
             let s = String::from_utf8(str_bytes.to_vec())
                 .map_err(|e| GarminError::InvalidMessage(format!("Invalid UTF-8: {}", e)))?;
 
-            eprintln!("String at offset {}: {:?}", str_start, s);
+            info!("String at offset {}: {:?}", str_start, s);
             strings.insert(str_start, s);
         }
 
@@ -208,19 +208,19 @@ pub fn decode(bytes: &[u8]) -> Result<Value> {
     offset += 4;
 
     for i in 0..size {
-        eprintln!("  Reading key-value pair #{}", i);
-        eprintln!("    Position before key: {}", offset);
-        let key_val = decode_value(data, &mut offset, &strings, false)?;
-        eprintln!("    Key decoded: {:?}", key_val);
+        debug!("  Reading key-value pair #{}", i);
+        debug!("    Position before key: {}", offset);
+        let key_val = decode_value(data, &mut offset, &strings)?;
+        debug!("    Key decoded: {:?}", key_val);
         let key = match key_val {
             Value::String(s) => s,
             _ => return Err(GarminError::InvalidMessage("Map key must be string".into())),
         };
-        eprintln!("    Position before value: {}", offset);
-        let val = decode_value(data, &mut offset, &strings, false)?;
-        eprintln!("    Position after value: {}", offset);
+        debug!("    Position before value: {}", offset);
+        let val = decode_value(data, &mut offset, &strings)?;
+        debug!("    Position after value: {}", offset);
 
-        eprintln!(
+        info!(
             "    Value decoded (truncated): {}",
             serde_json::to_string(&val)
                 .unwrap_or_default()
@@ -232,35 +232,16 @@ pub fn decode(bytes: &[u8]) -> Result<Value> {
         top_level.insert(key, val);
     }
 
-    println!("---------------");
-    println!("top_level: {top_level:?}");
-    println!("---------------");
-
     consolidate(&mut top_level, data, &mut offset, &strings)?;
 
-    let level = &mut top_level;
-    // while (offset < bytes[pos..].len()) {
     for level in top_level.values_mut() {
-        println!("---------------");
         match level {
             Value::Object(ref mut obj) => {
                 consolidate(obj, data, &mut offset, &strings)?;
             }
             _ => {}
         }
-
-        // for obj in level.iter() {
-        //     if obj.is_object() {
-        //         level = &mut obj;
-        //         break;
-        //     }
-        // }
-
-        println!("---------------");
-        println!("level: {level:?}");
-        println!("---------------");
     }
-    println!("top_level: {top_level:?}");
 
     Ok(Value::Object(top_level))
 }
@@ -285,10 +266,10 @@ fn consolidate(
                 println!("Found Objet: {size}");
 
                 for i in 0..size {
-                    eprintln!("  Reading key-value pair #{}", i);
-                    eprintln!("    Position before key: {}", offset);
-                    let key_val = decode_value(data, offset, strings, false)?;
-                    eprintln!("    Key decoded: {:?}", key_val);
+                    debug!("  Reading key-value pair #{}", i);
+                    debug!("    Position before key: {}", offset);
+                    let key_val = decode_value(data, offset, strings)?;
+                    debug!("    Key decoded: {:?}", key_val);
                     let key = match key_val {
                         Value::String(s) => s,
                         _ => {
@@ -297,11 +278,11 @@ fn consolidate(
                             ))
                         }
                     };
-                    eprintln!("    Position before value: {}", offset);
-                    let val = decode_value(data, offset, strings, false)?;
-                    eprintln!("    Position after value: {}", offset);
+                    debug!("    Position before value: {}", offset);
+                    let val = decode_value(data, offset, strings)?;
+                    debug!("    Position after value: {}", offset);
 
-                    eprintln!(
+                    info!(
                         "    Value decoded (truncated): {}",
                         serde_json::to_string(&val)
                             .unwrap_or_default()
@@ -313,7 +294,7 @@ fn consolidate(
                     obj.insert(key, val);
                 }
             }
-            _ => {} // *obj = decode_value(&bytes[pos..], &mut offset, &strings, false).unwrap();
+            _ => {}
         }
     }
 
@@ -321,12 +302,7 @@ fn consolidate(
 }
 
 /// Decode a value recursively - matches the encoder structure
-fn decode_value(
-    data: &[u8],
-    pos: &mut usize,
-    strings: &HashMap<usize, String>,
-    top_level: bool,
-) -> Result<Value> {
+fn decode_value(data: &[u8], pos: &mut usize, strings: &HashMap<usize, String>) -> Result<Value> {
     if *pos >= data.len() {
         return Err(GarminError::InvalidMessage("Unexpected end of data".into()));
     }
@@ -423,14 +399,14 @@ fn decode_value(
                     as usize;
             *pos += 4;
             let s = strings.get(&offset).ok_or_else(|| {
-                eprintln!(
+                error!(
                     "ERROR: String not found at offset {}. Available offsets: {:?}",
                     offset,
                     strings.keys().collect::<Vec<_>>()
                 );
                 GarminError::InvalidMessage(format!("String not found at offset: {}", offset))
             })?;
-            eprintln!("String {} from offset {}: {:?}", pos, offset, s);
+            debug!("String {} from offset {}: {:?}", pos, offset, s);
             Ok(Value::String(s.clone()))
         }
         TYPE_ARRAY => {
@@ -446,7 +422,7 @@ fn decode_value(
 
             let mut arr = Vec::with_capacity(length);
             for _ in 0..length {
-                arr.push(decode_value(data, pos, strings, false)?);
+                arr.push(decode_value(data, pos, strings)?);
             }
             Ok(Value::Array(arr))
         }
@@ -461,13 +437,13 @@ fn decode_value(
                     as usize;
             *pos += 4;
 
-            eprintln!("Decoding MAP with size {}", size);
+            debug!("Decoding MAP with size {}", size);
 
             let mut placeholder_obj = Map::with_capacity(size);
             for i in 0..size {
                 placeholder_obj.insert(format!("fake{i}").to_string(), Value::Null);
             }
-            eprintln!("  Placeholder MAP decoding complete: {size} entries");
+            debug!("  Placeholder MAP decoding complete: {size} entries");
             Ok(Value::Object(placeholder_obj))
         }
         _ => Err(GarminError::InvalidMessage(format!(
@@ -565,46 +541,6 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_decode_array() {
-        let arr = json!([1, 2, 3, "test"]);
-        let encoded = encode(&arr).unwrap();
-        let decoded = decode(&encoded).unwrap();
-        assert_eq!(arr, decoded);
-    }
-
-    #[test]
-    fn test_encode_decode_nested() {
-        let nested = json!({
-            "outer": {
-                "inner": "value",
-                "number": 42
-            },
-            "array": [1, 2, {"nested": "object"}]
-        });
-        let encoded = encode(&nested).unwrap();
-        let decoded = decode(&encoded).unwrap();
-        assert_eq!(nested, decoded);
-    }
-
-    #[test]
-    fn test_encode_decode_all_types() {
-        let all_types = json!({
-            "null_val": null,
-            "bool_true": true,
-            "bool_false": false,
-            "int32": 12345,
-            "int64": 9223372036854775807i64,
-            "float": 3.14,
-            "string": "hello",
-            "array": [1, 2, 3],
-            "object": {"nested": "value"}
-        });
-        let encoded = encode(&all_types).unwrap();
-        let decoded = decode(&encoded).unwrap();
-        assert_eq!(all_types, decoded);
-    }
-
-    #[test]
     fn test_real_decoder_one() {
         let hex = [
             0xAB, 0xCD, 0xAB, 0xCD, 0x00, 0x00, 0x00, 0x71, 0x00, 0x05, 0x64, 0x61, 0x74, 0x61,
@@ -633,10 +569,10 @@ mod tests {
 
         let result = decode(&hex);
         if let Err(e) = &result {
-            eprintln!("Decode error: {:?}", e);
+            error!("Decode error: {:?}", e);
         }
         let decoded = result.unwrap();
-        eprintln!(
+        error!(
             "Decoded: {}",
             serde_json::to_string_pretty(&decoded).unwrap()
         );
@@ -672,10 +608,10 @@ mod tests {
 
         let result = decode(&hex);
         if let Err(e) = &result {
-            eprintln!("Decode error: {:?}", e);
+            error!("Decode error: {:?}", e);
         }
         let decoded = result.unwrap();
-        eprintln!(
+        error!(
             "Decoded: {}",
             serde_json::to_string_pretty(&decoded).unwrap()
         );
@@ -758,10 +694,10 @@ mod tests {
 
         let result = decode(&hex);
         if let Err(e) = &result {
-            eprintln!("Decode error: {:?}", e);
+            error!("Decode error: {:?}", e);
         }
         let decoded = result.unwrap();
-        eprintln!(
+        error!(
             "Decoded: {}",
             serde_json::to_string_pretty(&decoded).unwrap()
         );

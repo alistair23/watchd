@@ -9,7 +9,9 @@
 
 use crate::data_transfer::DataTransferHandler;
 use crate::garmin_json;
+use crate::garmin_weather_api;
 use crate::types::{GarminError, Result};
+use crate::weather_provider::UnifiedWeatherProvider;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use log::{debug, error, info};
@@ -169,7 +171,7 @@ impl HttpRequest {
         let _max_size: Option<u32> = None;
         let _connection_timeout: Option<u32> = None;
         let _read_timeout: Option<u32> = None;
-        let mut compress_response_body = false;
+        let compress_response_body = false;
         let mut response_type: Option<u32> = None;
         let mut max_response_length: Option<u32> = None;
         let mut version: Option<u32> = None;
@@ -467,7 +469,7 @@ impl HttpRequest {
                     if request_field == 1 {
                         // ConnectIQ: Field 7 = COMPRESS_RESPONSE_BODY (bool)
                         if wire_type == 0 {
-                            let (val, len_bytes) = read_varint(&data[pos..])?;
+                            let (_val, len_bytes) = read_varint(&data[pos..])?;
                             pos += len_bytes;
                             // compress_response_body = val != 0;
                             // debug!("Parsed compressResponseBody: {}", compress_response_body);
@@ -691,6 +693,12 @@ impl HttpResponse {
                 .or_else(|| request.headers.get("Accept-Encoding"))
                 .map(|s| s.as_str())
                 .unwrap_or("");
+
+            debug!("      Original body: {:x?}", &self.body);
+            debug!(
+                "      Original body: {}",
+                String::from_utf8_lossy(&self.body)
+            );
 
             if accept_encoding == "gzip" {
                 info!("   🗜️  Compressing response with gzip");
@@ -1144,8 +1152,14 @@ impl HttpResponse {
     }
 }
 
-/// Handle an HTTP request and generate a response
-pub fn handle_http_request(request: &HttpRequest) -> HttpResponse {
+/// Handle an HTTP request with optional weather provider for Garmin weather API interception
+///
+/// If a weather provider is provided and the request is to Garmin's weather API,
+/// it will be intercepted and responded to locally instead of being proxied.
+pub async fn handle_http_request_with_weather(
+    request: &HttpRequest,
+    weather_provider: Option<&UnifiedWeatherProvider>,
+) -> HttpResponse {
     println!(
         "🌐 HTTP Request: {} {}",
         request.method.as_str(),
@@ -1153,8 +1167,35 @@ pub fn handle_http_request(request: &HttpRequest) -> HttpResponse {
     );
     println!("   Full URL: {}", request.url);
 
+    // Check if this URL should be blocked
+    if garmin_weather_api::is_garmin_blocked_url(&request.url) {
+        println!("   🚫 Blocking request to Garmin service");
+        return garmin_weather_api::handle_garmin_blocked_request(request);
+    }
+
+    // Check if this is a Garmin weather API request that should be intercepted
+    if let Some(provider) = weather_provider {
+        if garmin_weather_api::is_garmin_weather_api(&request.url) {
+            println!("   🎯 Intercepting Garmin weather API request");
+            match garmin_weather_api::handle_garmin_weather_request(request, provider).await {
+                Ok(response) => {
+                    println!(
+                        "   ✅ Weather API handled locally, status: {}",
+                        response.status
+                    );
+                    return response;
+                }
+                Err(e) => {
+                    eprintln!("   ❌ Weather API handler error: {}", e);
+                    // Fall back to proxying if local handling fails
+                    println!("   ⚠️  Falling back to proxy");
+                }
+            }
+        }
+    }
+
     // Proxy the request to the internet
-    match proxy_http_request(request) {
+    match proxy_http_request(request).await {
         Ok(response) => {
             println!("   ✅ Proxied successfully, status: {}", response.status);
             response
@@ -1168,7 +1209,7 @@ pub fn handle_http_request(request: &HttpRequest) -> HttpResponse {
 }
 
 /// Proxy an HTTP request to the actual internet destination
-fn proxy_http_request(request: &HttpRequest) -> Result<HttpResponse> {
+async fn proxy_http_request(request: &HttpRequest) -> Result<HttpResponse> {
     println!("   🔄 Proxying to: {}", request.url);
     println!("   📋 Request details:");
     println!("      Method: {}", request.method.as_str());
@@ -1208,7 +1249,7 @@ fn proxy_http_request(request: &HttpRequest) -> Result<HttpResponse> {
     };
 
     // Create a blocking reqwest client
-    let client = reqwest::blocking::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| GarminError::InvalidMessage(format!("Failed to create HTTP client: {}", e)))?;
@@ -1316,6 +1357,7 @@ fn proxy_http_request(request: &HttpRequest) -> Result<HttpResponse> {
 
     let response = client
         .execute(built_request)
+        .await
         .map_err(|e| GarminError::InvalidMessage(format!("HTTP request failed: {}", e)))?;
 
     // Extract status
@@ -1336,6 +1378,7 @@ fn proxy_http_request(request: &HttpRequest) -> Result<HttpResponse> {
     // Extract body
     let body = response
         .bytes()
+        .await
         .map_err(|e| GarminError::InvalidMessage(format!("Failed to read response body: {}", e)))?
         .to_vec();
 
@@ -1723,151 +1766,6 @@ fn parse_url(url: &str) -> (String, HashMap<String, String>) {
     (path, query)
 }
 
-/// Convert Garmin's binary body format to JSON
-/// Format: [00] [len] [key] [00 00] [len] [value] ... with DA 7A markers for nested data
-fn convert_garmin_body_to_json(data: &[u8]) -> Result<Vec<u8>> {
-    debug!(
-        "Converting Garmin Monkey C body to JSON: {} bytes",
-        data.len()
-    );
-
-    let mut pos = 0;
-
-    // Phase 1: Parse header section (string dictionary)
-    // Format: u16 length, null-terminated string, repeated
-    let mut string_dict: std::collections::HashMap<usize, String> =
-        std::collections::HashMap::new();
-    let header_start = pos;
-
-    while pos < data.len() {
-        // Check for DA 7A DA 7A marker (end of header, start of data)
-        if pos + 4 <= data.len()
-            && data[pos] == 0xDA
-            && data[pos + 1] == 0x7A
-            && data[pos + 2] == 0xDA
-            && data[pos + 3] == 0x7A
-        {
-            debug!("Found DA 7A DA 7A separator at pos {}", pos);
-            pos += 4; // Skip the separator
-            break;
-        }
-
-        // Read u16 length (big-endian as per Monkey C spec)
-        if pos + 2 > data.len() {
-            break;
-        }
-        let str_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
-        pos += 2;
-
-        if str_len == 0 {
-            continue;
-        }
-
-        if pos + str_len > data.len() {
-            debug!("Invalid string length {} at pos {}", str_len, pos - 2);
-            break;
-        }
-
-        // Store the offset relative to header_start (before reading length bytes)
-        // Offsets point to the start of the u16 length, not the string data
-        let offset = (pos - 2) - header_start;
-
-        // Read null-terminated string
-        let string = String::from_utf8_lossy(&data[pos..pos + str_len])
-            .trim_end_matches('\0')
-            .to_string();
-        pos += str_len;
-
-        debug!("Dictionary[offset={}]: {}", offset, string);
-        string_dict.insert(offset, string);
-    }
-
-    if string_dict.is_empty() {
-        return Err(GarminError::InvalidMessage("No dictionary found".into()));
-    }
-
-    debug!("Parsed dictionary with {} strings", string_dict.len());
-    println!("      📚 Dictionary parsed: {} strings", string_dict.len());
-    let mut sorted_offsets: Vec<_> = string_dict.keys().cloned().collect();
-    sorted_offsets.sort();
-    for (_i, offset) in sorted_offsets.iter().enumerate().take(20) {
-        println!("         [offset={}] = {}", offset, &string_dict[offset]);
-    }
-    if string_dict.len() > 20 {
-        println!("         ... and {} more", string_dict.len() - 20);
-    }
-
-    // Phase 2: Parse data section
-    // Skip 4-byte data section size (big-endian)
-    if pos + 4 <= data.len() {
-        let data_size =
-            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-        debug!("Data section size: 0x{:08X}", data_size);
-        println!("      📊 Data section size: 0x{:08X}", data_size);
-        pos += 4;
-    }
-
-    println!("      🔍 Parsing data section starting at pos {}...", pos);
-    if pos < data.len() {
-        println!("         First byte (type marker): 0x{:02X}", data[pos]);
-    }
-
-    // Parse the data structure
-    let value = parse_monkeyc_value(data, &mut pos, &string_dict, header_start)?;
-
-    // Convert to JSON with duplicate key handling
-    let json = garmin_value_to_json(&value)?;
-
-    debug!("Converted to JSON: {}", json);
-    println!("      ✅ Conversion successful: {} bytes", json.len());
-    println!("      Output JSON: {}", json);
-
-    // Post-process sensor states to move metadata from array to root level
-    // and fix schema mismatches
-    let json_bytes = json.into_bytes();
-    let cleaned_json = clean_sensor_states_structure(&json_bytes)?;
-    let fixed_json = fix_sensor_schema_mismatches(&cleaned_json)?;
-    Ok(fixed_json)
-}
-
-/// Clean up sensor states structure by moving metadata from data array to root level
-fn clean_sensor_states_structure(json_data: &[u8]) -> Result<Vec<u8>> {
-    use std::str;
-
-    let json_str = str::from_utf8(json_data)
-        .map_err(|e| GarminError::InvalidMessage(format!("Invalid UTF-8 in JSON: {}", e)))?;
-
-    let mut json_value: serde_json::Value = serde_json::from_str(json_str)
-        .map_err(|e| GarminError::InvalidMessage(format!("Failed to parse JSON: {}", e)))?;
-
-    // Check if this matches sensor states pattern: data array starts with "type", "update_sensor_states"
-    if let Some(obj) = json_value.as_object_mut() {
-        if let Some(data_array) = obj.get_mut("data").and_then(|v| v.as_array_mut()) {
-            // Check if first two elements are the metadata strings
-            if data_array.len() >= 2
-                && data_array[0].as_str() == Some("type")
-                && data_array[1].as_str() == Some("update_sensor_states")
-            {
-                debug!("Cleaning sensor states structure: moving metadata to root level");
-
-                // Remove the first two elements (metadata)
-                data_array.remove(0); // Remove "type"
-                let type_value = data_array.remove(0); // Remove and get "update_sensor_states"
-
-                // Set the root-level "type" to "update_sensor_states"
-                obj.insert("type".to_string(), type_value);
-
-                debug!("Sensor states structure cleaned: metadata moved to root level");
-            }
-        }
-    }
-
-    // Convert back to JSON bytes
-    serde_json::to_vec(&json_value).map_err(|e| {
-        GarminError::InvalidMessage(format!("Failed to serialize cleaned JSON: {}", e))
-    })
-}
-
 /// Convert OAuth JSON request to form-encoded format
 /// OAuth token endpoints expect application/x-www-form-urlencoded, not JSON
 fn convert_oauth_to_form_encoded(
@@ -1876,7 +1774,14 @@ fn convert_oauth_to_form_encoded(
 ) -> Result<Vec<u8>> {
     use std::str;
 
-    let json_str = str::from_utf8(json_data)
+    // Trim any null terminators from the data (common with C/protobuf strings)
+    let json_data_trimmed = if json_data.last() == Some(&0) {
+        &json_data[..json_data.len() - 1]
+    } else {
+        json_data
+    };
+
+    let json_str = str::from_utf8(json_data_trimmed)
         .map_err(|e| GarminError::InvalidMessage(format!("Invalid UTF-8 in JSON: {}", e)))?;
 
     let json_value: serde_json::Value = serde_json::from_str(json_str)
@@ -1938,750 +1843,6 @@ fn convert_oauth_to_form_encoded(
     Ok(json_data.to_vec())
 }
 
-/// Fix schema mismatches in sensor data
-/// Specifically handles the case where respiration_rate's icon field gets parsed
-/// as part of the activity sensor due to schema count mismatch
-fn fix_sensor_schema_mismatches(json_data: &[u8]) -> Result<Vec<u8>> {
-    use std::str;
-
-    let json_str = str::from_utf8(json_data)
-        .map_err(|e| GarminError::InvalidMessage(format!("Invalid UTF-8 in JSON: {}", e)))?;
-
-    let mut json_value: serde_json::Value = serde_json::from_str(json_str)
-        .map_err(|e| GarminError::InvalidMessage(format!("Failed to parse JSON: {}", e)))?;
-
-    // Check if this is sensor states data
-    if let Some(obj) = json_value.as_object_mut() {
-        if obj.get("type").and_then(|v| v.as_str()) == Some("update_sensor_states") {
-            if let Some(data_array) = obj.get_mut("data").and_then(|v| v.as_array_mut()) {
-                // Find respiration_rate and activity sensors
-                let mut respiration_idx = None;
-                let mut activity_idx = None;
-
-                for (idx, item) in data_array.iter().enumerate() {
-                    if let Some(sensor_obj) = item.as_object() {
-                        if let Some(unique_id) =
-                            sensor_obj.get("unique_id").and_then(|v| v.as_str())
-                        {
-                            if unique_id == "respiration_rate" {
-                                respiration_idx = Some(idx);
-                            } else if unique_id == "activity" {
-                                activity_idx = Some(idx);
-                            }
-                        }
-                    }
-                }
-
-                // If both sensors exist and activity has an icon field but no type field,
-                // we need to fix the mismatch
-                if let (Some(resp_idx), Some(act_idx)) = (respiration_idx, activity_idx) {
-                    let activity_obj = data_array[act_idx].as_object().cloned();
-
-                    if let Some(act_obj) = activity_obj {
-                        // Check if activity has icon but no type (indicates mismatch)
-                        if act_obj.contains_key("icon") && !act_obj.contains_key("type") {
-                            debug!("Detected schema mismatch: fixing respiration_rate and activity sensors");
-
-                            // Move icon from activity to respiration_rate
-                            if let Some(icon_value) = act_obj.get("icon") {
-                                if let Some(resp_obj) = data_array[resp_idx].as_object_mut() {
-                                    resp_obj.insert("icon".to_string(), icon_value.clone());
-                                }
-                            }
-
-                            // Remove icon from activity and add type
-                            if let Some(act_obj_mut) = data_array[act_idx].as_object_mut() {
-                                act_obj_mut.remove("icon");
-                                act_obj_mut.insert("type".to_string(), serde_json::json!("sensor"));
-                            }
-
-                            debug!("Schema mismatch fixed: icon moved to respiration_rate, type added to activity");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Convert back to JSON bytes
-    serde_json::to_vec(&json_value)
-        .map_err(|e| GarminError::InvalidMessage(format!("Failed to serialize fixed JSON: {}", e)))
-}
-
-/// Convert GarminValue to JSON string, handling duplicate keys
-fn garmin_value_to_json(value: &GarminValue) -> Result<String> {
-    fn value_to_json_value(
-        val: &GarminValue,
-        key_counters: &mut std::collections::HashMap<String, usize>,
-    ) -> serde_json::Value {
-        match val {
-            GarminValue::Null => serde_json::Value::Null,
-            GarminValue::Integer(i) => serde_json::Value::Number((*i).into()),
-            GarminValue::Float(f) => serde_json::Number::from_f64(*f as f64)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null),
-            GarminValue::String(s) => serde_json::Value::String(s.clone()),
-            GarminValue::Boolean(b) => serde_json::Value::Bool(*b),
-            GarminValue::Long(l) => serde_json::Value::Number((*l).into()),
-            GarminValue::Double(d) => serde_json::Number::from_f64(*d)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null),
-            GarminValue::Object(fields) => {
-                let mut map = serde_json::Map::new();
-                let mut local_counters = std::collections::HashMap::new();
-
-                for (key, value) in fields {
-                    // Check if this key already exists (duplicate)
-                    let final_key = if map.contains_key(key) {
-                        // Duplicate key - number them
-                        let count = local_counters.entry(key.clone()).or_insert(0);
-                        *count += 1;
-                        format!("{}_{}", key, count)
-                    } else {
-                        key.clone()
-                    };
-
-                    map.insert(final_key, value_to_json_value(value, key_counters));
-                }
-                serde_json::Value::Object(map)
-            }
-            GarminValue::Array(items) => {
-                let arr: Vec<_> = items
-                    .iter()
-                    .map(|v| value_to_json_value(v, key_counters))
-                    .collect();
-                serde_json::Value::Array(arr)
-            }
-        }
-    }
-
-    let mut counters = std::collections::HashMap::new();
-    let json_value = value_to_json_value(value, &mut counters);
-    serde_json::to_string(&json_value)
-        .map_err(|e| GarminError::InvalidMessage(format!("Failed to serialize JSON: {}", e)))
-}
-
-#[derive(Debug)]
-enum GarminValue {
-    Null,
-    Integer(i32),
-    Float(f32),
-    String(String),
-    Boolean(bool),
-    Long(i64),
-    Double(f64),
-    Object(Vec<(String, GarminValue)>),
-    Array(Vec<GarminValue>),
-}
-
-impl serde::Serialize for GarminValue {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        match self {
-            GarminValue::Null => serializer.serialize_none(),
-            GarminValue::Integer(i) => serializer.serialize_i32(*i),
-            GarminValue::Float(f) => serializer.serialize_f32(*f),
-            GarminValue::String(s) => serializer.serialize_str(s),
-            GarminValue::Boolean(b) => serializer.serialize_bool(*b),
-            GarminValue::Long(l) => serializer.serialize_i64(*l),
-            GarminValue::Double(d) => serializer.serialize_f64(*d),
-            GarminValue::Object(fields) => {
-                use serde::ser::SerializeMap;
-                let mut map = serializer.serialize_map(Some(fields.len()))?;
-                for (k, v) in fields {
-                    map.serialize_entry(k, v)?;
-                }
-                map.end()
-            }
-            GarminValue::Array(items) => {
-                use serde::ser::SerializeSeq;
-                let mut seq = serializer.serialize_seq(Some(items.len()))?;
-                for item in items {
-                    seq.serialize_element(item)?;
-                }
-                seq.end()
-            }
-        }
-    }
-}
-
-fn parse_monkeyc_value(
-    data: &[u8],
-    pos: &mut usize,
-    string_dict: &std::collections::HashMap<usize, String>,
-    header_start: usize,
-) -> Result<GarminValue> {
-    if *pos >= data.len() {
-        return Ok(GarminValue::Null);
-    }
-
-    let type_marker = data[*pos];
-    *pos += 1;
-
-    match type_marker {
-        0x00 => {
-            // NULL
-            Ok(GarminValue::Null)
-        }
-        0x01 => {
-            // sint32
-            if *pos + 4 > data.len() {
-                return Err(GarminError::InvalidMessage(format!(
-                    "Not enough data for sint32 at pos {} (need 4 bytes, have {})",
-                    *pos,
-                    data.len() - *pos
-                )));
-            }
-            let value =
-                i32::from_be_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
-            *pos += 4;
-            Ok(GarminValue::Integer(value))
-        }
-        0x02 => {
-            // float
-            if *pos + 4 > data.len() {
-                return Err(GarminError::InvalidMessage(format!(
-                    "Not enough data for float at pos {} (need 4 bytes, have {})",
-                    *pos,
-                    data.len() - *pos
-                )));
-            }
-            let value =
-                f32::from_be_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
-            *pos += 4;
-            Ok(GarminValue::Float(value))
-        }
-        0x03 => {
-            // string (offset into header)
-            if *pos + 4 > data.len() {
-                return Err(GarminError::InvalidMessage(format!(
-                    "Not enough data for string offset at pos {} (need 4 bytes, have {})",
-                    *pos,
-                    data.len() - *pos
-                )));
-            }
-            let offset =
-                u32::from_be_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]])
-                    as usize;
-            *pos += 4;
-
-            if let Some(string) = string_dict.get(&offset) {
-                Ok(GarminValue::String(string.clone()))
-            } else {
-                Ok(GarminValue::Null)
-            }
-        }
-        0x05 => {
-            // array
-            if *pos + 4 > data.len() {
-                return Err(GarminError::InvalidMessage(format!(
-                    "Not enough data for array count at pos {} (need 4 bytes, have {})",
-                    *pos,
-                    data.len() - *pos
-                )));
-            }
-            let count =
-                i32::from_be_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]])
-                    as usize;
-            *pos += 4;
-
-            let mut items = Vec::new();
-            let mut parsed_count = 0;
-
-            // Parse array elements, flattening any schema-first arrays
-            while parsed_count < count {
-                let value = parse_monkeyc_value(data, pos, string_dict, header_start)?;
-                parsed_count += 1;
-
-                // If the value is an array (from schema-first object decoding), flatten it
-                match value {
-                    GarminValue::Array(inner_items) => {
-                        // This is a schema-first decoded array - flatten it into parent
-                        items.extend(inner_items);
-
-                        // If flattening caused us to reach or exceed the expected count,
-                        // we're done parsing this array
-                        if items.len() >= count {
-                            break;
-                        }
-                    }
-                    _ => {
-                        items.push(value);
-                    }
-                }
-            }
-
-            Ok(GarminValue::Array(items))
-        }
-        0x09 => {
-            // boolean
-            if *pos >= data.len() {
-                return Err(GarminError::InvalidMessage(format!(
-                    "Not enough data for boolean at pos {}",
-                    *pos
-                )));
-            }
-            let value = data[*pos] != 0;
-            *pos += 1;
-            Ok(GarminValue::Boolean(value))
-        }
-        0x0B => {
-            // key-value map (object)
-            if *pos + 4 > data.len() {
-                return Err(GarminError::InvalidMessage(format!(
-                    "Not enough data for object count at pos {} (need 4 bytes, have {})",
-                    *pos,
-                    data.len() - *pos
-                )));
-            }
-            let count =
-                i32::from_be_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]])
-                    as usize;
-            *pos += 4;
-
-            // Check for schema-first encoding: if the first "key" is an object marker (0x0B),
-            // this indicates a compressed encoding where object schemas are defined first,
-            // followed by the actual data for all objects
-            if *pos < data.len() && data[*pos] == 0x0B && count > 0 {
-                // Parse schema definitions (consecutive 0x0B markers with field counts)
-                // Note: We parse ALL consecutive 0x0B markers, not just 'count' of them
-                // because the 'count' refers to the parent object structure, not the number of schemas
-                let mut schema_definitions = Vec::new();
-                while *pos < data.len() && data[*pos] == 0x0B {
-                    *pos += 1; // Skip 0x0B marker
-                    if *pos + 4 > data.len() {
-                        break;
-                    }
-                    let field_count = i32::from_be_bytes([
-                        data[*pos],
-                        data[*pos + 1],
-                        data[*pos + 2],
-                        data[*pos + 3],
-                    ]) as usize;
-                    *pos += 4;
-                    schema_definitions.push(field_count);
-                }
-
-                // Now parse the actual objects using the schema definitions
-                // Data is laid out as: all fields for obj1, all fields for obj2, etc.
-                // Each field is: key (string ref), value (any type)
-                let mut objects = Vec::new();
-                for (obj_idx, field_count) in schema_definitions.iter().enumerate() {
-                    let mut obj_fields = Vec::new();
-                    for i in 0..*field_count {
-                        // Parse key (should be a string reference)
-                        let key_value = parse_monkeyc_value(data, pos, string_dict, header_start)?;
-                        let key = match key_value {
-                            GarminValue::String(s) => s,
-                            _ => format!("field_{}", i),
-                        };
-
-                        // Parse value (immediately follows key)
-                        let value = parse_monkeyc_value(data, pos, string_dict, header_start)?;
-                        obj_fields.push((key, value));
-                    }
-                    objects.push(GarminValue::Object(obj_fields));
-                }
-
-                // Return as an array of objects
-                return Ok(GarminValue::Array(objects));
-            }
-
-            // Standard object parsing (key-value pairs)
-            let mut fields = Vec::new();
-            for i in 0..count {
-                // Parse key (should be a string reference, type 0x03)
-                let key_value = parse_monkeyc_value(data, pos, string_dict, header_start)?;
-                let key = match key_value {
-                    GarminValue::String(s) => s,
-                    _ => format!("field_{}", i),
-                };
-
-                // Parse value
-                let value = parse_monkeyc_value(data, pos, string_dict, header_start)?;
-
-                fields.push((key, value));
-            }
-
-            Ok(GarminValue::Object(fields))
-        }
-        0x0E => {
-            // long (sint64)
-            if *pos + 8 > data.len() {
-                return Err(GarminError::InvalidMessage(format!(
-                    "Not enough data for long at pos {} (need 8 bytes, have {})",
-                    *pos,
-                    data.len() - *pos
-                )));
-            }
-            let value = i64::from_be_bytes([
-                data[*pos],
-                data[*pos + 1],
-                data[*pos + 2],
-                data[*pos + 3],
-                data[*pos + 4],
-                data[*pos + 5],
-                data[*pos + 6],
-                data[*pos + 7],
-            ]);
-            *pos += 8;
-            Ok(GarminValue::Long(value))
-        }
-        0x0F => {
-            // double
-            if *pos + 8 > data.len() {
-                return Err(GarminError::InvalidMessage(format!(
-                    "Not enough data for double at pos {} (need 8 bytes, have {})",
-                    *pos,
-                    data.len() - *pos
-                )));
-            }
-            let value = f64::from_be_bytes([
-                data[*pos],
-                data[*pos + 1],
-                data[*pos + 2],
-                data[*pos + 3],
-                data[*pos + 4],
-                data[*pos + 5],
-                data[*pos + 6],
-                data[*pos + 7],
-            ]);
-            *pos += 8;
-            Ok(GarminValue::Double(value))
-        }
-        _ => Ok(GarminValue::Null),
-    }
-}
-
-/// Convert JSON response body back to Garmin's binary format
-/// The watch expects responses in Garmin's binary key-value format
-/// Transform ConnectIQ JSON structure:
-/// From: {"data": {"type": "...", "3t": {"0t": {...}}, "template": "...", ...}, "template": "..."}
-/// To: {"type": "...", "data": {"3": {"template": "..."}, "0": {"template": "..."}, ...}}
-fn transform_connectiq_json(json_data: &[u8]) -> Result<Vec<u8>> {
-    use std::str;
-
-    let json_str = str::from_utf8(json_data)
-        .map_err(|e| GarminError::InvalidMessage(format!("Invalid UTF-8 in JSON: {}", e)))?;
-
-    let json_value: serde_json::Value = serde_json::from_str(json_str)
-        .map_err(|e| GarminError::InvalidMessage(format!("Failed to parse JSON: {}", e)))?;
-
-    // Check if this is a ConnectIQ structure with a "data" object containing "type"
-    if let Some(obj) = json_value.as_object() {
-        if let Some(data_obj) = obj.get("data").and_then(|v| v.as_object()) {
-            if let Some(type_value) = data_obj.get("type") {
-                // Extract type from data
-                let type_clone = type_value.clone();
-
-                // Build new data object by flattening nested structures
-                let mut new_data = serde_json::Map::new();
-
-                // Collect all templates in a vector: (key, template_value)
-                let mut templates_in_order = Vec::new();
-
-                // Find the nested structure and extract the key chain
-                let mut nested_keys = Vec::new();
-                for (key, value) in data_obj.iter() {
-                    if key.ends_with('t') && key != "template" && !key.starts_with("template_") {
-                        // This is the start of nested chain (e.g., "6t")
-                        nested_keys.push(key.clone());
-
-                        // Walk through the nested structure to collect all keys
-                        let mut current = value;
-                        loop {
-                            if let Some(obj) = current.as_object() {
-                                if obj.len() == 1 {
-                                    let (k, v) = obj.iter().next().unwrap();
-                                    if k == "template" {
-                                        // Reached the innermost template
-                                        break;
-                                    } else if k != "type" {
-                                        nested_keys.push(k.clone());
-                                        current = v;
-                                    } else {
-                                        break;
-                                    }
-                                } else if obj.contains_key("template") {
-                                    // This level has a template
-                                    break;
-                                } else {
-                                    break;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                        break; // Only process first nested structure
-                    }
-                }
-
-                // Extract the innermost nested template
-                let mut innermost_template = None;
-                for (key, value) in data_obj.iter() {
-                    if key.ends_with('t') && key != "template" && !key.starts_with("template_") {
-                        // Walk through nested structure to find innermost template
-                        let mut current = value;
-                        loop {
-                            if let Some(obj) = current.as_object() {
-                                if let Some(tmpl) = obj.get("template") {
-                                    innermost_template = Some(tmpl.clone());
-                                    break;
-                                } else if obj.len() == 1 {
-                                    let (_, v) = obj.iter().next().unwrap();
-                                    current = v;
-                                } else {
-                                    break;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                        break;
-                    }
-                }
-
-                // Collect templates in order:
-                // 1. Innermost nested template (first)
-                // 2. Direct template from data (second)
-                // 3. template_1, template_2, etc. from data
-                // 4. Top-level template (last)
-
-                // Add innermost nested template first
-                if let Some(tmpl) = innermost_template {
-                    templates_in_order.push(tmpl);
-                }
-
-                // Add direct template from data_obj
-                for (key, value) in data_obj.iter() {
-                    if key == "template" {
-                        templates_in_order.push(value.clone());
-                        break;
-                    }
-                }
-
-                // Add numbered templates from data_obj
-                for (key, value) in data_obj.iter() {
-                    if key.starts_with("template_") {
-                        templates_in_order.push(value.clone());
-                    }
-                }
-
-                // Add top-level template
-                for (key, value) in obj.iter() {
-                    if key == "template" {
-                        templates_in_order.push(value.clone());
-                        break;
-                    }
-                }
-
-                // Assign templates to nested keys in order
-                // nested_keys contains: [6t, 2t, 0t, 5t, 3t, 4, 1t]
-                // templates_in_order contains: [template1, template2, ..., template7]
-                for (i, key) in nested_keys.iter().enumerate() {
-                    if i < templates_in_order.len() {
-                        let mut template_obj = serde_json::Map::new();
-                        template_obj.insert("template".to_string(), templates_in_order[i].clone());
-                        new_data.insert(key.clone(), serde_json::Value::Object(template_obj));
-                    }
-                }
-
-                // Copy over any other fields that aren't part of the nested structure
-                for (key, value) in data_obj.iter() {
-                    if key != "type"
-                        && !key.ends_with('t')
-                        && key != "template"
-                        && !key.starts_with("template_")
-                    {
-                        new_data.insert(key.clone(), value.clone());
-                    }
-                }
-
-                // Copy over top-level fields (like glanceTemplate) that are siblings to data
-                for (key, value) in obj.iter() {
-                    if key != "data" && key != "template" && !key.starts_with("template_") {
-                        new_data.insert(key.clone(), value.clone());
-                    }
-                }
-
-                // Build final structure
-                let mut result = serde_json::Map::new();
-                result.insert("type".to_string(), type_clone);
-                result.insert("data".to_string(), serde_json::Value::Object(new_data));
-
-                let transformed_json = serde_json::to_string(&serde_json::Value::Object(result))
-                    .map_err(|e| {
-                        GarminError::InvalidMessage(format!(
-                            "Failed to serialize transformed JSON: {}",
-                            e
-                        ))
-                    })?;
-
-                return Ok(transformed_json.into_bytes());
-            }
-        }
-    }
-
-    // If no transformation needed, return original
-    Ok(json_data.to_vec())
-}
-
-fn convert_json_to_garmin_body(json_data: &[u8]) -> Result<Vec<u8>> {
-    use std::str;
-
-    println!(
-        "   📝 Converting JSON to Monkey C body: {} bytes",
-        json_data.len()
-    );
-    debug!(
-        "Converting JSON to Monkey C body: {} bytes",
-        json_data.len()
-    );
-
-    let json_str = str::from_utf8(json_data)
-        .map_err(|e| GarminError::InvalidMessage(format!("Invalid UTF-8 in JSON: {}", e)))?;
-
-    println!("   📝 JSON response content: {}", json_str);
-    debug!("JSON response string: {}", json_str);
-
-    // Parse JSON using serde_json
-    let json_value: serde_json::Value = serde_json::from_str(json_str)
-        .map_err(|e| GarminError::InvalidMessage(format!("Failed to parse JSON: {}", e)))?;
-
-    // Build Monkey C binary format
-    let mut result = Vec::new();
-
-    // Add magic marker
-    result.extend_from_slice(&[0xAB, 0xCD, 0xAB, 0xCD]);
-
-    // Build header section (string dictionary) and data section
-    let mut header_section = Vec::new();
-    let mut data_section = Vec::new();
-    let mut string_offsets: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-
-    // Encode the JSON value and collect strings
-    encode_monkeyc_value(
-        &json_value,
-        &mut data_section,
-        &mut header_section,
-        &mut string_offsets,
-    )?;
-
-    // Write header size (u32 big-endian)
-    let header_size = header_section.len() as u32;
-    result.extend_from_slice(&header_size.to_be_bytes());
-
-    // Write header section
-    result.extend_from_slice(&header_section);
-
-    // Write DA 7A DA 7A separator
-    result.extend_from_slice(&[0xDA, 0x7A, 0xDA, 0x7A]);
-
-    // Write data section size (u32 big-endian)
-    let data_size = data_section.len() as u32;
-    result.extend_from_slice(&data_size.to_be_bytes());
-
-    // Write data section
-    result.extend_from_slice(&data_section);
-
-    println!("   ✅ Converted to Monkey C body: {} bytes", result.len());
-    debug!("Converted to Monkey C body: {} bytes", result.len());
-
-    if result.len() > 0 {
-        let hex_dump: String = result
-            .iter()
-            .take(100)
-            .map(|b| format!("{:02X}", b))
-            .collect::<Vec<_>>()
-            .join(" ");
-        println!("   📋 Monkey C body hex (first 100 bytes): {}", hex_dump);
-    }
-
-    Ok(result)
-}
-
-fn encode_monkeyc_value(
-    value: &serde_json::Value,
-    data_buf: &mut Vec<u8>,
-    header_buf: &mut Vec<u8>,
-    string_offsets: &mut std::collections::HashMap<String, usize>,
-) -> Result<()> {
-    match value {
-        serde_json::Value::Null => {
-            data_buf.push(0x00); // NULL type
-        }
-        serde_json::Value::Bool(b) => {
-            data_buf.push(0x09); // boolean type
-            data_buf.push(if *b { 1 } else { 0 });
-        }
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
-                    data_buf.push(0x01); // sint32 type
-                    data_buf.extend_from_slice(&(i as i32).to_be_bytes());
-                } else {
-                    data_buf.push(0x0E); // long type
-                    data_buf.extend_from_slice(&i.to_be_bytes());
-                }
-            } else if let Some(f) = n.as_f64() {
-                data_buf.push(0x0F); // double type
-                data_buf.extend_from_slice(&f.to_be_bytes());
-            }
-        }
-        serde_json::Value::String(s) => {
-            data_buf.push(0x03); // string reference type
-            let offset = add_string_to_header(s, header_buf, string_offsets);
-            data_buf.extend_from_slice(&(offset as u32).to_be_bytes());
-        }
-        serde_json::Value::Array(arr) => {
-            data_buf.push(0x05); // array type
-            data_buf.extend_from_slice(&(arr.len() as i32).to_be_bytes());
-            for item in arr {
-                encode_monkeyc_value(item, data_buf, header_buf, string_offsets)?;
-            }
-        }
-        serde_json::Value::Object(obj) => {
-            data_buf.push(0x0B); // object type
-            data_buf.extend_from_slice(&(obj.len() as i32).to_be_bytes());
-            for (key, val) in obj {
-                // Encode key as string reference
-                data_buf.push(0x03);
-                let offset = add_string_to_header(key, header_buf, string_offsets);
-                data_buf.extend_from_slice(&(offset as u32).to_be_bytes());
-                // Encode value
-                encode_monkeyc_value(val, data_buf, header_buf, string_offsets)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn add_string_to_header(
-    s: &str,
-    header_buf: &mut Vec<u8>,
-    string_offsets: &mut std::collections::HashMap<String, usize>,
-) -> usize {
-    if let Some(&offset) = string_offsets.get(s) {
-        return offset;
-    }
-
-    let offset = header_buf.len();
-    string_offsets.insert(s.to_string(), offset);
-
-    // Write u16 big-endian length
-    let len = (s.len() + 1) as u16; // +1 for null terminator
-    header_buf.extend_from_slice(&len.to_be_bytes());
-
-    // Write null-terminated string
-    header_buf.extend_from_slice(s.as_bytes());
-    header_buf.push(0x00);
-
-    offset
-}
-
 fn compute_checksum(data: &[u8]) -> u16 {
     let mut crc: u16 = 0;
 
@@ -2711,50 +1872,6 @@ mod tests {
         assert_eq!(encode_varint(127), vec![127]);
         assert_eq!(encode_varint(128), vec![0x80, 0x01]);
         assert_eq!(encode_varint(300), vec![0xAC, 0x02]);
-    }
-
-    #[test]
-    fn test_garmin_json_integration() {
-        // Test that garmin_json module works with HTTP module
-        use crate::garmin_json;
-
-        let json = serde_json::json!({
-            "type": "update_sensor_states",
-            "data": [
-                {"id": 1, "value": 100},
-                {"id": 2, "value": 200}
-            ]
-        });
-
-        let encoded = garmin_json::encode(&json).expect("Failed to encode");
-        let decoded = garmin_json::decode(&encoded).expect("Failed to decode");
-
-        assert_eq!(json, decoded);
-        assert_eq!(
-            decoded.get("type").and_then(|v| v.as_str()),
-            Some("update_sensor_states"),
-            "Root type should be 'update_sensor_states'"
-        );
-    }
-
-    #[test]
-    fn test_plain_text_response_encoding() {
-        // Test that plain text responses (non-JSON) are properly handled
-        use crate::garmin_json;
-
-        // Simulate a plain text error response like "401: Unauthorized"
-        let plain_text = b"401: Unauthorized";
-
-        // Should be wrapped as a JSON string
-        let text = String::from_utf8_lossy(plain_text).to_string();
-        let json_value = serde_json::Value::String(text);
-
-        // Should encode successfully
-        let encoded = garmin_json::encode(&json_value).expect("Failed to encode");
-
-        // Should decode back to the same string
-        let decoded = garmin_json::decode(&encoded).expect("Failed to decode");
-        assert_eq!(decoded.as_str(), Some("401: Unauthorized"));
     }
 
     #[test]
@@ -2820,9 +1937,6 @@ mod tests {
 
         // Find where string section starts (after first 8 bytes)
         if encoded.len() > 8 && &encoded[0..4] == &[0xAB, 0xCD, 0xAB, 0xCD] {
-            let string_section_len =
-                u32::from_be_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]) as usize;
-
             // Extract: [string section] + [data section magic and data]
             let without_outer_magic = &encoded[8..];
 

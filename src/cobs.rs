@@ -133,17 +133,18 @@ impl CobsCoDec {
             }
 
             // Append zero byte after payload unless code == 0xFF (continuation)
-            // or we hit the terminating zero with non-empty payload
+            // The logic:
+            // - If payload_size is 0, the code byte represents just a zero (always append if at end)
+            // - If payload_size > 0, append zero only if there's more data coming (pos < buffer_len)
             if code_value != 0xFF {
-                if pos < buffer_len && self.buffer[pos] == 0 {
-                    // Next byte is terminator - only skip appending zero if we had payload
-                    if payload_size == 0 {
-                        decoded.push(0);
-                    }
-                } else {
-                    // Either more segments coming or we're past buffer_len - always append
+                if payload_size == 0 {
+                    // Code with no payload represents a zero - always append it
+                    decoded.push(0);
+                } else if pos < buffer_len {
+                    // Code with payload - only append implicit zero if more data follows
                     decoded.push(0);
                 }
+                // If payload_size > 0 and pos >= buffer_len, don't append (no trailing zero in original data)
             }
         }
 
