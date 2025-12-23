@@ -4139,10 +4139,6 @@ async fn connect_to_watch(
 
     let ble_arc = Arc::new(ble_support);
 
-    // Wait for connection to stabilize
-    println!("   ⏳ Waiting for connection to stabilize...");
-    sleep(Duration::from_secs(3)).await;
-
     // Discover characteristics
     println!("\n🔍 Discovering services and characteristics...");
     if let Err(e) = ble_arc.discover_services().await {
