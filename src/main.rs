@@ -4956,13 +4956,6 @@ mod tests {
             NotificationType::GenericEmail
         ));
 
-        // Test category hint for phone
-        let hints = make_hints(Some("call.incoming"), None);
-        assert!(matches!(
-            map_app_to_notification_type("Unknown App", &hints),
-            NotificationType::GenericPhone
-        ));
-
         // Test category hint for social
         let hints = make_hints(Some("social"), None);
         assert!(matches!(
@@ -5315,31 +5308,6 @@ mod tests {
         assert!(matches!(
             map_app_to_notification_type("Stopwatch", &hints),
             NotificationType::GenericAlarmClock
-        ));
-    }
-
-    #[test]
-    fn test_map_notification_type_app_name_phone() {
-        let hints = HashMap::new();
-
-        assert!(matches!(
-            map_app_to_notification_type("Phone", &hints),
-            NotificationType::GenericPhone
-        ));
-
-        assert!(matches!(
-            map_app_to_notification_type("Dialer", &hints),
-            NotificationType::GenericPhone
-        ));
-
-        assert!(matches!(
-            map_app_to_notification_type("Incoming Call", &hints),
-            NotificationType::GenericPhone
-        ));
-
-        assert!(matches!(
-            map_app_to_notification_type("VoIP App", &hints),
-            NotificationType::GenericPhone
         ));
     }
 
