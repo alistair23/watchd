@@ -1186,9 +1186,8 @@ pub async fn handle_http_request_with_weather(
                     return response;
                 }
                 Err(e) => {
-                    eprintln!("   ❌ Weather API handler error: {}", e);
-                    // Fall back to proxying if local handling fails
-                    println!("   ⚠️  Falling back to proxy");
+                    error!("   ❌ Weather API handler error: {}", e);
+                    return garmin_weather_api::handle_garmin_blocked_request(request);
                 }
             }
         }

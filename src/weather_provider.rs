@@ -82,6 +82,12 @@ pub struct UnifiedHourlyWeather {
     pub pop: f64,
     pub condition_code: i32,
     pub description: String,
+    pub uv_index: Option<f32>,
+    pub dew_point: Option<f64>,
+    pub pressure: Option<i32>,
+    pub visibility: Option<i32>,
+    pub clouds: Option<i32>,
+    pub air_quality: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +103,7 @@ pub struct UnifiedDailyWeather {
     pub pop: f64,
     pub condition_code: i32,
     pub description: String,
+    pub uv_max: Option<f32>,
 }
 
 /// Unified weather provider
@@ -209,7 +216,27 @@ impl UnifiedWeatherProvider {
                 condition_code: bom.current.condition_code,
                 description: bom.current.description,
             },
-            hourly: Vec::new(), // BOM doesn't provide hourly in simple observations
+            hourly: bom
+                .hourly
+                .iter()
+                .map(|h| UnifiedHourlyWeather {
+                    dt: h.dt,
+                    temp: celsius_to_kelvin(h.temp),
+                    feels_like: celsius_to_kelvin(h.feels_like),
+                    humidity: h.humidity,
+                    wind_speed: h.wind_speed,
+                    wind_deg: h.wind_deg,
+                    pop: h.pop,
+                    condition_code: h.condition_code,
+                    description: h.description.clone(),
+                    uv_index: h.uv_index,
+                    dew_point: h.dew_point.map(celsius_to_kelvin),
+                    pressure: h.pressure,
+                    visibility: h.visibility,
+                    clouds: h.clouds,
+                    air_quality: h.air_quality,
+                })
+                .collect(),
             daily: bom
                 .daily
                 .iter()
@@ -225,6 +252,7 @@ impl UnifiedWeatherProvider {
                     pop: d.pop,
                     condition_code: d.condition_code,
                     description: d.description.clone(),
+                    uv_max: d.uv_max,
                 })
                 .collect(),
         }

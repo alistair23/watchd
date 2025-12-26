@@ -97,7 +97,10 @@ pub async fn handle_garmin_weather_request(
 
     println!("   ✅ Weather data fetched successfully");
     println!("   Location: {}", weather_data.location_name);
-    println!("   Current temp: {:.1}°C", weather_data.current.temp);
+    println!(
+        "   Current temp: {:.1}°C",
+        weather_data.current.temp - 273.15
+    );
     println!("   Hourly forecasts: {}", weather_data.hourly.len());
     println!("   Daily forecasts: {}", weather_data.daily.len());
 
@@ -209,11 +212,32 @@ fn handle_hourly_forecast(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(12);
 
+    println!(
+        "   📊 Processing hourly forecasts: {} available, requesting {}",
+        weather.hourly.len(),
+        duration
+    );
+
     let mut hourly_forecasts = Vec::new();
 
     for (i, hourly) in weather.hourly.iter().enumerate() {
         if i >= duration {
             break;
+        }
+
+        if i < 3 {
+            use chrono::{TimeZone, Utc};
+            let dt_utc = Utc.timestamp_opt(hourly.dt, 0).unwrap();
+            let dt_local = Utc.timestamp_opt(hourly.dt + (10 * 3600), 0).unwrap();
+            println!(
+                "   Hour {}: dt={}, UTC time={}, Local(+10)={}, temp={:.1}°C, condition={}",
+                i,
+                hourly.dt,
+                dt_utc.format("%Y-%m-%d %H:%M"),
+                dt_local.format("%Y-%m-%d %H:%M"),
+                hourly.temp - 273.15,
+                hourly.condition_code
+            );
         }
 
         let forecast = WeatherForecastHour {
@@ -227,18 +251,30 @@ fn handle_hourly_forecast(
                 direction: hourly.wind_deg,
             },
             icon: hourly.condition_code,
-            dew_point: None, // TODO: Add dew point to hourly data
-            uv_index: None,  // TODO: Add UV index to hourly data
+            dew_point: hourly
+                .dew_point
+                .map(|dp| convert_temperature(dp, temp_unit)),
+            uv_index: hourly.uv_index,
             relative_humidity: hourly.humidity,
             feels_like_temperature: convert_temperature(hourly.feels_like, temp_unit),
-            visibility: None,
-            pressure: None,
-            air_quality: None,
-            cloud_cover: None,
+            visibility: hourly.visibility.map(|v| WeatherValue {
+                value: v as f64,
+                units: "METER".to_string(),
+            }),
+            pressure: hourly
+                .pressure
+                .map(|p| convert_pressure(p as f64, "MILLIBAR")),
+            air_quality: hourly.air_quality.map(|aq| serde_json::json!(aq)),
+            cloud_cover: hourly.clouds,
         };
 
         hourly_forecasts.push(forecast);
     }
+
+    println!(
+        "   ✅ Returning {} hourly forecasts",
+        hourly_forecasts.len()
+    );
 
     serde_json::to_string(&hourly_forecasts).map_err(|e| format!("JSON serialization error: {}", e))
 }
@@ -279,7 +315,23 @@ fn handle_daily_forecast(
             break;
         }
 
+        // Use actual forecast date from BOM data instead of calculating
+        // BOM provides the correct date for each forecast day
         let day_of_week = get_day_of_week(daily.dt, version);
+
+        if i < 3 {
+            use chrono::{TimeZone, Utc};
+            let dt_utc = Utc.timestamp_opt(daily.dt, 0).unwrap();
+            println!(
+                "   Daily {}: date={}, day={}, desc='{}', icon={}, temp_max={:.1}°C",
+                i,
+                dt_utc.format("%Y-%m-%d"),
+                day_of_week,
+                daily.description,
+                daily.condition_code,
+                daily.temp_max - 273.15
+            );
+        }
 
         let forecast = WeatherForecastDay {
             day_of_week,

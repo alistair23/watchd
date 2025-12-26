@@ -25,6 +25,51 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
+/// Encode latitude/longitude to geohash with precision 6
+fn encode_geohash(lat: f64, lon: f64) -> String {
+    const BASE32: &[u8] = b"0123456789bcdefghjkmnpqrstuvwxyz";
+    const PRECISION: usize = 6;
+
+    let mut geohash = String::new();
+    let mut lat_range = (-90.0, 90.0);
+    let mut lon_range = (-180.0, 180.0);
+    let mut is_even = true;
+    let mut bit = 0;
+    let mut ch = 0;
+
+    while geohash.len() < PRECISION {
+        if is_even {
+            let mid = (lon_range.0 + lon_range.1) / 2.0;
+            if lon > mid {
+                ch |= 1 << (4 - bit);
+                lon_range.0 = mid;
+            } else {
+                lon_range.1 = mid;
+            }
+        } else {
+            let mid = (lat_range.0 + lat_range.1) / 2.0;
+            if lat > mid {
+                ch |= 1 << (4 - bit);
+                lat_range.0 = mid;
+            } else {
+                lat_range.1 = mid;
+            }
+        }
+
+        is_even = !is_even;
+
+        if bit < 4 {
+            bit += 1;
+        } else {
+            geohash.push(BASE32[ch as usize] as char);
+            bit = 0;
+            ch = 0;
+        }
+    }
+
+    geohash
+}
+
 #[derive(Error, Debug)]
 pub enum BomWeatherError {
     #[error("HTTP request failed: {0}")]
@@ -54,6 +99,8 @@ pub struct BomLocation {
     pub wmo_id: String,
     /// Forecast area code (for forecasts)
     pub aac: String,
+    /// Geohash for BOM API v1 (for hourly/daily forecasts)
+    pub geohash: String,
 }
 
 /// BOM Observation data (current conditions)
@@ -178,6 +225,7 @@ pub struct BomWeatherData {
     pub lon: f64,
     pub location_name: String,
     pub current: BomCurrentWeather,
+    pub hourly: Vec<BomHourlyWeather>,
     pub daily: Vec<BomDailyWeather>,
 }
 
@@ -198,6 +246,25 @@ pub struct BomCurrentWeather {
 }
 
 #[derive(Debug, Clone)]
+pub struct BomHourlyWeather {
+    pub dt: i64,
+    pub temp: f64,
+    pub feels_like: f64,
+    pub humidity: i32,
+    pub wind_speed: f64,
+    pub wind_deg: i32,
+    pub pop: f64,
+    pub condition_code: i32,
+    pub description: String,
+    pub uv_index: Option<f32>,
+    pub dew_point: Option<f64>,
+    pub pressure: Option<i32>,
+    pub visibility: Option<i32>,
+    pub clouds: Option<i32>,
+    pub air_quality: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
 pub struct BomDailyWeather {
     pub dt: i64,
     pub temp_min: f64,
@@ -210,6 +277,7 @@ pub struct BomDailyWeather {
     pub humidity: i32,
     pub sunrise: Option<i64>,
     pub sunset: Option<i64>,
+    pub uv_max: Option<f32>,
 }
 
 /// Cached BOM weather data
@@ -256,6 +324,7 @@ impl BomWeatherService {
                 lon: 151.2093,
                 wmo_id: "94768".to_string(), // Sydney Observatory Hill
                 aac: "NSW_PT131".to_string(),
+                geohash: "r3gx2f".to_string(), // Sydney
             },
             BomLocation {
                 name: "Melbourne".to_string(),
@@ -264,6 +333,7 @@ impl BomWeatherService {
                 lon: 144.9631,
                 wmo_id: "94866".to_string(), // Melbourne
                 aac: "VIC_PT042".to_string(),
+                geohash: "r1r0f9".to_string(), // Melbourne
             },
             BomLocation {
                 name: "Brisbane".to_string(),
@@ -272,6 +342,7 @@ impl BomWeatherService {
                 lon: 153.0251,
                 wmo_id: "94576".to_string(), // Brisbane
                 aac: "QLD_PT001".to_string(),
+                geohash: "r6dp23".to_string(), // Brisbane
             },
             BomLocation {
                 name: "Perth".to_string(),
@@ -280,6 +351,7 @@ impl BomWeatherService {
                 lon: 115.8605,
                 wmo_id: "94608".to_string(), // Perth Airport
                 aac: "WA_PT001".to_string(),
+                geohash: "qd66kq".to_string(), // Perth
             },
             BomLocation {
                 name: "Adelaide".to_string(),
@@ -288,6 +360,7 @@ impl BomWeatherService {
                 lon: 138.6007,
                 wmo_id: "94672".to_string(), // Adelaide
                 aac: "SA_PT001".to_string(),
+                geohash: "r1dqn6".to_string(), // Adelaide
             },
             BomLocation {
                 name: "Canberra".to_string(),
@@ -296,6 +369,7 @@ impl BomWeatherService {
                 lon: 149.1300,
                 wmo_id: "94926".to_string(), // Canberra Airport
                 aac: "ACT_PT001".to_string(),
+                geohash: "r3dp6h".to_string(), // Canberra
             },
             BomLocation {
                 name: "Hobart".to_string(),
@@ -304,6 +378,7 @@ impl BomWeatherService {
                 lon: 147.3272,
                 wmo_id: "94970".to_string(), // Hobart
                 aac: "TAS_PT001".to_string(),
+                geohash: "r0m6zs".to_string(), // Hobart
             },
             BomLocation {
                 name: "Darwin".to_string(),
@@ -312,6 +387,7 @@ impl BomWeatherService {
                 lon: 130.8456,
                 wmo_id: "94120".to_string(), // Darwin Airport
                 aac: "NT_PT001".to_string(),
+                geohash: "rqeq6h".to_string(), // Darwin
             },
         ];
 
@@ -389,23 +465,57 @@ impl BomWeatherService {
         // Find nearest location
         let location = self
             .find_nearest_location(lat, lon)
-            .ok_or(BomWeatherError::LocationNotFound(lat, lon))?;
+            .ok_or_else(|| BomWeatherError::LocationNotFound(lat, lon))?;
+
+        // Calculate distance for logging
+        let distance = ((location.lat - lat).powi(2) + (location.lon - lon).powi(2)).sqrt();
+        let distance_km = distance * 111.0; // Rough conversion to km
+
+        // Calculate geohash for the actual requested coordinates
+        let actual_geohash = encode_geohash(lat, lon);
 
         log::info!(
-            "Using BOM location: {} ({}), station ID: {}",
+            "Using BOM location: {} ({}), station ID: {}, location geohash: {}",
             location.name,
             location.state,
-            location.wmo_id
+            location.wmo_id,
+            location.geohash
+        );
+        log::info!(
+            "Distance from requested coords: {:.1} km (requested: {:.4}°, {:.4}° -> using: {:.4}°, {:.4}°)",
+            distance_km,
+            lat,
+            lon,
+            location.lat,
+            location.lon
+        );
+        log::info!(
+            "Using calculated geohash: {} (from exact coordinates)",
+            actual_geohash
         );
 
         // Fetch current observations
         let observations = self.fetch_observations(location).await?;
 
-        // Fetch forecast data
-        let forecasts = self.fetch_forecasts(location).await?;
+        // Fetch daily forecast data first (needed for sunrise/sunset times)
+        let daily_forecasts = self
+            .fetch_daily_forecasts_with_geohash(&actual_geohash)
+            .await?;
+
+        // Fetch hourly forecast data from BOM API using calculated geohash
+        // Pass daily forecasts to get sunrise/sunset info for nighttime detection
+        let (hourly_forecasts, current_icon_descriptor) = self
+            .fetch_hourly_forecasts_with_geohash(&actual_geohash)
+            .await?;
 
         // Parse weather data with forecasts
-        let weather_data = self.parse_weather_data(location, observations, forecasts)?;
+        let weather_data = self.parse_weather_data(
+            location,
+            observations,
+            &current_icon_descriptor,
+            hourly_forecasts,
+            daily_forecasts,
+        )?;
 
         // Cache the result
         {
@@ -463,135 +573,438 @@ impl BomWeatherService {
         Ok(obs_data)
     }
 
-    /// Fetch forecasts from BOM
-    async fn fetch_forecasts(
+    /// Fetch hourly forecasts from BOM API v1 using a specific geohash
+    async fn fetch_hourly_forecasts_with_geohash(
         &self,
-        location: &BomLocation,
-    ) -> Result<Vec<BomForecast>, BomWeatherError> {
-        // BOM forecast JSON URL format
-        let product_id = match location.state.as_str() {
-            "NSW" => "IDN11060",
-            "VIC" => "IDV10753",
-            "QLD" => "IDQ11295",
-            "WA" => "IDW14199",
-            "SA" => "IDS10044",
-            "TAS" => "IDT16710",
-            "ACT" => "IDN11060", // ACT uses NSW products
-            "NT" => "IDD10150",
-            _ => "IDN11060", // Default to NSW
-        };
-
+        geohash: &str,
+    ) -> Result<(Vec<BomHourlyWeather>, String), BomWeatherError> {
         let url = format!(
-            "http://www.bom.gov.au/fwo/{}/{}.json",
-            product_id, product_id
+            "https://api.weather.bom.gov.au/v1/locations/{}/forecasts/hourly",
+            geohash
         );
 
-        log::debug!("Fetching BOM forecasts from: {}", url);
+        log::debug!("Fetching BOM hourly forecasts from: {}", url);
 
-        let response = self.client.get(&url).send().await?;
+        match self.client.get(&url).send().await {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<serde_json::Value>().await {
+                    Ok(data) => {
+                        return self.parse_hourly_forecast_data(data);
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to parse hourly forecast JSON: {}", e);
+                        return Ok((Vec::new(), "".into()));
+                    }
+                }
+            }
+            Ok(response) => {
+                log::warn!("BOM API returned status {}", response.status());
+                return Ok((Vec::new(), "".into()));
+            }
+            Err(e) => {
+                log::warn!("Failed to fetch hourly forecasts: {}", e);
+                return Ok((Vec::new(), "".into()));
+            }
+        }
+    }
 
-        if !response.status().is_success() {
-            return Err(BomWeatherError::NoDataAvailable(format!(
-                "HTTP {} for forecast {}",
-                response.status(),
-                product_id
-            )));
+    /// Parse hourly forecast data from BOM API
+    fn parse_hourly_forecast_data(
+        &self,
+        data: serde_json::Value,
+    ) -> Result<(Vec<BomHourlyWeather>, String), BomWeatherError> {
+        let mut hourly = Vec::new();
+        let mut current_icon_descriptor = "";
+
+        if let Some(forecasts) = data.get("data").and_then(|d| d.as_array()) {
+            log::info!("BOM API returned {} hourly forecasts", forecasts.len());
+
+            // Get current time to filter out past forecasts
+            let now = Utc::now().timestamp();
+
+            // Log all forecast times to identify any gaps or cutoffs
+            if forecasts.len() > 0 {
+                log::info!("Forecast time range:");
+                if let Some(first) = forecasts.first() {
+                    if let Some(first_time) = first.get("time").and_then(|t| t.as_str()) {
+                        log::info!("  First: {}", first_time);
+                    }
+                }
+                if let Some(last) = forecasts.last() {
+                    if let Some(last_time) = last.get("time").and_then(|t| t.as_str()) {
+                        log::info!("  Last: {}", last_time);
+                    }
+                }
+            }
+
+            for forecast in forecasts.iter() {
+                // Get time
+                let time_str = forecast
+                    .get("time")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("unknown");
+
+                let dt = forecast
+                    .get("time")
+                    .and_then(|t| t.as_str())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.timestamp())
+                    .unwrap_or(0);
+
+                // Skip past forecasts - only include current hour or future
+                if dt < now {
+                    // Save the most recenty icon description to use for the
+                    // current observation
+                    current_icon_descriptor = forecast
+                        .get("icon_descriptor")
+                        .and_then(|i| i.as_str())
+                        .unwrap_or("clear");
+                    continue;
+                }
+
+                // Stop after we have 24 future forecasts
+                if hourly.len() >= 24 {
+                    break;
+                }
+
+                // Log first few future forecasts
+                if hourly.len() < 6 {
+                    log::debug!(
+                        "Future hourly forecast {}: time={}, timestamp={}, temp={}, icon={}",
+                        hourly.len(),
+                        time_str,
+                        dt,
+                        forecast.get("temp").and_then(|t| t.as_f64()).unwrap_or(0.0),
+                        forecast
+                            .get("icon_descriptor")
+                            .and_then(|i| i.as_str())
+                            .unwrap_or("unknown")
+                    );
+                }
+
+                // Get temperature
+                let temp = forecast
+                    .get("temp")
+                    .and_then(|t| t.as_f64())
+                    .unwrap_or(20.0);
+
+                let feels_like = forecast
+                    .get("temp_feels_like")
+                    .and_then(|t| t.as_f64())
+                    .unwrap_or(temp);
+
+                let humidity = forecast
+                    .get("humidity")
+                    .and_then(|h| h.as_i64())
+                    .unwrap_or(50) as i32;
+
+                let wind_speed = forecast
+                    .get("wind")
+                    .and_then(|w| w.get("speed_kilometre"))
+                    .and_then(|s| s.as_f64())
+                    .unwrap_or(0.0)
+                    / 3.6; // Convert km/h to m/s
+
+                let wind_deg = forecast
+                    .get("wind")
+                    .and_then(|w| w.get("direction"))
+                    .and_then(|d| d.as_str())
+                    .and_then(|s| Self::parse_wind_direction_string(s))
+                    .unwrap_or(0);
+
+                let pop = forecast
+                    .get("rain")
+                    .and_then(|r| r.get("chance"))
+                    .and_then(|c| c.as_f64())
+                    .unwrap_or(0.0)
+                    / 100.0;
+
+                let icon_descriptor = forecast
+                    .get("icon_descriptor")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("clear");
+
+                let is_night = forecast
+                    .get("is_night")
+                    .and_then(|t| t.as_bool())
+                    .unwrap_or(false);
+
+                let condition_code = Self::map_icon_descriptor_to_garmin(icon_descriptor, is_night);
+
+                // Use Garmin-style description based on condition code for consistency
+                let description = Self::garmin_condition_to_description(condition_code);
+
+                // Debug: log first forecast to see available fields
+                if hourly.len() == 0 {
+                    log::info!(
+                        "First hourly forecast JSON: {}",
+                        serde_json::to_string_pretty(forecast)
+                            .unwrap_or_else(|_| "error".to_string())
+                    );
+                }
+
+                // UV index not available in BOM JSON API hourly forecasts
+                // Would need to fetch from separate XML product files
+                let uv_index = None;
+
+                // Extract wind gust if available
+                let _wind_gust = forecast
+                    .get("wind")
+                    .and_then(|w| w.get("gust_kilometre"))
+                    .and_then(|g| g.as_f64())
+                    .map(|g| g / 3.6); // Convert km/h to m/s
+
+                // BOM hourly forecasts don't provide these fields in the JSON API
+                // They would need to come from current observations or be interpolated
+                let dew_point = None;
+                let pressure = None;
+                let visibility = None;
+                let clouds = None;
+                let air_quality = None;
+
+                hourly.push(BomHourlyWeather {
+                    dt,
+                    temp,
+                    feels_like,
+                    humidity,
+                    wind_speed,
+                    wind_deg,
+                    pop,
+                    condition_code,
+                    description,
+                    uv_index,
+                    dew_point,
+                    pressure,
+                    visibility,
+                    clouds,
+                    air_quality,
+                });
+            }
+
+            log::info!(
+                "Successfully parsed {} future hourly forecasts (filtered from {} total)",
+                hourly.len(),
+                forecasts.len()
+            );
+        } else {
+            log::warn!("No 'data' array found in BOM hourly forecast response");
         }
 
-        let forecast_data: serde_json::Value = response.json().await?;
+        Ok((hourly, current_icon_descriptor.into()))
+    }
 
-        // Parse the forecast data - BOM precis forecast structure
-        // Structure: { observations: { notice: [...], forecasts: [{...}] } }
-        let forecast_locations = forecast_data
-            .get("observations")
-            .and_then(|o| o.get("forecasts"))
-            .and_then(|f| f.as_array())
-            .ok_or_else(|| {
-                BomWeatherError::InvalidData(
-                    "Invalid forecast structure - missing observations.forecasts".to_string(),
-                )
-            })?;
+    /// Parse wind direction string to degrees
+    fn parse_wind_direction_string(dir: &str) -> Option<i32> {
+        match dir {
+            "N" => Some(0),
+            "NNE" => Some(22),
+            "NE" => Some(45),
+            "ENE" => Some(67),
+            "E" => Some(90),
+            "ESE" => Some(112),
+            "SE" => Some(135),
+            "SSE" => Some(157),
+            "S" => Some(180),
+            "SSW" => Some(202),
+            "SW" => Some(225),
+            "WSW" => Some(247),
+            "W" => Some(270),
+            "WNW" => Some(292),
+            "NW" => Some(315),
+            "NNW" => Some(337),
+            "CALM" => Some(0),
+            _ => None,
+        }
+    }
 
-        // Find the location entry matching our AAC
-        let mut forecasts = Vec::new();
-        for loc_entry in forecast_locations {
-            if let Some(aac) = loc_entry.get("aac").and_then(|a| a.as_str()) {
-                if aac == location.aac {
-                    // Found our location - now extract forecast_period array
-                    if let Some(periods) =
-                        loc_entry.get("forecast_period").and_then(|f| f.as_array())
-                    {
-                        for (index, period) in periods.iter().enumerate() {
-                            // Build BomForecast from the period data
-                            let forecast = BomForecast {
-                                index: index as i32,
-                                product_id: loc_entry
-                                    .get("product_id")
-                                    .and_then(|p| p.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                aac: aac.to_string(),
-                                name: loc_entry
-                                    .get("name")
-                                    .and_then(|n| n.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                state: loc_entry
-                                    .get("state")
-                                    .and_then(|s| s.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                forecast_period: period
-                                    .get("forecast_period")
-                                    .and_then(|f| f.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                start_time_local: period
-                                    .get("start_time_local")
-                                    .and_then(|s| s.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                end_time_local: period
-                                    .get("end_time_local")
-                                    .and_then(|e| e.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                minimum_temperature: period
-                                    .get("minimum_temperature")
-                                    .and_then(|t| t.as_f64()),
-                                maximum_temperature: period
-                                    .get("maximum_temperature")
-                                    .and_then(|t| t.as_f64()),
-                                precis: period
-                                    .get("precis")
-                                    .and_then(|p| p.as_str())
-                                    .unwrap_or("Unknown")
-                                    .to_string(),
-                                probability_of_precipitation: period
-                                    .get("probability_of_precipitation")
-                                    .and_then(|p| p.as_str())
-                                    .map(|s| s.to_string()),
-                                icon_descriptor: period
-                                    .get("icon_descriptor")
-                                    .and_then(|i| i.as_str())
-                                    .map(|s| s.to_string()),
-                            };
-                            forecasts.push(forecast);
-                        }
+    /// Fetch daily forecasts from BOM API v1 using a specific geohash
+    async fn fetch_daily_forecasts_with_geohash(
+        &self,
+        geohash: &str,
+    ) -> Result<Vec<BomDailyWeather>, BomWeatherError> {
+        let url = format!(
+            "https://api.weather.bom.gov.au/v1/locations/{}/forecasts/daily",
+            geohash
+        );
+
+        log::debug!("Fetching BOM daily forecasts from: {}", url);
+
+        match self.client.get(&url).send().await {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<serde_json::Value>().await {
+                    Ok(data) => {
+                        return self.parse_daily_forecast_data(data);
                     }
-                    break; // Found our location, no need to continue
+                    Err(e) => {
+                        log::warn!("Failed to parse daily forecast JSON: {}", e);
+                        return Ok(Vec::new());
+                    }
                 }
+            }
+            Ok(response) => {
+                log::warn!("BOM API returned status {}", response.status());
+                return Ok(Vec::new());
+            }
+            Err(e) => {
+                log::warn!("Failed to fetch daily forecasts: {}", e);
+                return Ok(Vec::new());
+            }
+        }
+    }
+
+    /// Parse daily forecast data from BOM API
+    fn parse_daily_forecast_data(
+        &self,
+        data: serde_json::Value,
+    ) -> Result<Vec<BomDailyWeather>, BomWeatherError> {
+        let mut daily = Vec::new();
+
+        if let Some(forecasts) = data.get("data").and_then(|d| d.as_array()) {
+            let base_date = Utc::now().date_naive();
+
+            for (index, forecast) in forecasts.iter().take(7).enumerate() {
+                // Get date - use index to calculate if parsing fails
+                let dt = if let Some(date_str) = forecast.get("date").and_then(|d| d.as_str()) {
+                    log::debug!("Parsing BOM date: {}", date_str);
+
+                    if let Ok(parsed_date) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+                    {
+                        if let Some(datetime) = parsed_date.and_hms_opt(12, 0, 0) {
+                            let timestamp = datetime.and_utc().timestamp();
+                            log::debug!("  Parsed to timestamp: {}", timestamp);
+                            timestamp
+                        } else {
+                            log::warn!("Failed to create time for date: {}", date_str);
+                            (base_date + chrono::Duration::days(index as i64))
+                                .and_hms_opt(12, 0, 0)
+                                .unwrap()
+                                .and_utc()
+                                .timestamp()
+                        }
+                    } else {
+                        log::warn!("Failed to parse date: {}, using index-based date", date_str);
+                        (base_date + chrono::Duration::days(index as i64))
+                            .and_hms_opt(12, 0, 0)
+                            .unwrap()
+                            .and_utc()
+                            .timestamp()
+                    }
+                } else {
+                    log::warn!("No date field found in forecast, using index {}", index);
+                    (base_date + chrono::Duration::days(index as i64))
+                        .and_hms_opt(12, 0, 0)
+                        .unwrap()
+                        .and_utc()
+                        .timestamp()
+                };
+
+                let temp_min = forecast
+                    .get("temp_min")
+                    .and_then(|t| t.as_f64())
+                    .unwrap_or(15.0);
+
+                let temp_max = forecast
+                    .get("temp_max")
+                    .and_then(|t| t.as_f64())
+                    .unwrap_or(25.0);
+
+                let humidity = forecast
+                    .get("humidity")
+                    .and_then(|h| h.get("max"))
+                    .and_then(|m| m.as_i64())
+                    .unwrap_or(50) as i32;
+
+                let wind_speed = forecast
+                    .get("wind")
+                    .and_then(|w| w.get("speed_kilometre"))
+                    .and_then(|s| s.as_f64())
+                    .unwrap_or(0.0)
+                    / 3.6; // Convert km/h to m/s
+
+                let wind_deg = forecast
+                    .get("wind")
+                    .and_then(|w| w.get("direction"))
+                    .and_then(|d| d.as_str())
+                    .and_then(|s| Self::parse_wind_direction_string(s))
+                    .unwrap_or(0);
+
+                let pop = forecast
+                    .get("rain")
+                    .and_then(|r| r.get("chance"))
+                    .and_then(|c| c.as_f64())
+                    .unwrap_or(0.0)
+                    / 100.0;
+
+                let icon_descriptor = forecast
+                    .get("icon_descriptor")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("clear");
+
+                if index < 3 {
+                    log::debug!(
+                        "Daily forecast {}: date={}, icon={}, temp_min={}, temp_max={}",
+                        index,
+                        forecast
+                            .get("date")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("unknown"),
+                        icon_descriptor,
+                        temp_min,
+                        temp_max
+                    );
+                }
+
+                let condition_code = Self::map_icon_descriptor_to_garmin(icon_descriptor, false);
+
+                let description = forecast
+                    .get("extended_text")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or(icon_descriptor)
+                    .to_string();
+
+                let sunrise = forecast
+                    .get("astronomical")
+                    .and_then(|a| a.get("sunrise_time"))
+                    .and_then(|s| s.as_str())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.timestamp());
+
+                let sunset = forecast
+                    .get("astronomical")
+                    .and_then(|a| a.get("sunset_time"))
+                    .and_then(|s| s.as_str())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.timestamp());
+
+                // Try to get UV max from forecast data
+                let uv_max = forecast
+                    .get("uv")
+                    .and_then(|u| u.get("max_index"))
+                    .and_then(|m| m.as_f64())
+                    .map(|u| u as f32);
+
+                if index < 3 {
+                    log::debug!("Daily forecast {} UV max: {:?}", index, uv_max);
+                }
+
+                daily.push(BomDailyWeather {
+                    dt,
+                    temp_min,
+                    temp_max,
+                    condition_code,
+                    description,
+                    pop,
+                    wind_speed,
+                    wind_deg,
+                    humidity,
+                    sunrise,
+                    sunset,
+                    uv_max,
+                });
             }
         }
 
-        if forecasts.is_empty() {
-            log::warn!(
-                "No forecasts found for location {}, using dummy data",
-                location.name
-            );
-        }
-
-        Ok(forecasts)
+        Ok(daily)
     }
 
     /// Parse BOM data into unified weather structure
@@ -599,7 +1012,9 @@ impl BomWeatherService {
         &self,
         location: &BomLocation,
         obs_data: BomObservationsData,
-        forecasts: Vec<BomForecast>,
+        current_icon_descriptor: &str,
+        hourly_forecasts: Vec<BomHourlyWeather>,
+        daily_forecasts: Vec<BomDailyWeather>,
     ) -> Result<BomWeatherData, BomWeatherError> {
         let latest_obs =
             obs_data
@@ -625,93 +1040,24 @@ impl BomWeatherService {
             visibility: Self::parse_visibility(&latest_obs.vis_km),
             wind_speed: latest_obs.wind_spd_kmh.unwrap_or(0.0).max(0.0) / 3.6, // Convert to m/s
             wind_deg: Self::parse_wind_direction(&latest_obs.wind_dir),
-            condition_code: Self::map_bom_to_garmin_condition(
-                &latest_obs.weather,
-                latest_obs.cloud_oktas,
-            ),
-            description: String::new(), // Will be set below
+            condition_code: Self::map_icon_descriptor_to_garmin(&current_icon_descriptor, false),
+            description: current_icon_descriptor.into(),
         };
 
-        // Generate proper description from condition code
-        let description = if let Some(ref weather_text) = latest_obs.weather {
-            if weather_text != "-" && !weather_text.is_empty() {
-                weather_text.clone()
-            } else {
-                Self::garmin_condition_to_description(current.condition_code)
-            }
+        // Use provided hourly forecasts, or empty if unavailable
+        let hourly = if !hourly_forecasts.is_empty() {
+            hourly_forecasts
         } else {
-            Self::garmin_condition_to_description(current.condition_code)
+            log::warn!("No hourly forecasts available from BOM API");
+            Vec::new()
         };
 
-        let mut current = current;
-        current.description = description.clone();
-
-        // Parse daily forecasts from BOM data
-        let daily: Vec<BomDailyWeather> = if !forecasts.is_empty() {
-            forecasts
-                .iter()
-                .take(7) // Take up to 7 days
-                .map(|f| {
-                    let forecast_dt = dt + (f.index as i64 * 86400); // Add days in seconds
-
-                    let temp_min = f.minimum_temperature.unwrap_or(15.0);
-                    let temp_max = f.maximum_temperature.unwrap_or(25.0);
-
-                    // Parse precipitation probability
-                    let pop = if let Some(ref precip) = f.probability_of_precipitation {
-                        // BOM format: "10%" or "Slight chance" etc
-                        if let Some(pct) = precip.trim_end_matches('%').parse::<f64>().ok() {
-                            pct / 100.0
-                        } else if precip.contains("Slight") {
-                            0.2
-                        } else if precip.contains("Medium") {
-                            0.5
-                        } else if precip.contains("High") || precip.contains("Very high") {
-                            0.8
-                        } else {
-                            0.0
-                        }
-                    } else {
-                        0.0
-                    };
-
-                    // Map icon descriptor to condition code
-                    let condition_code = if let Some(ref icon) = f.icon_descriptor {
-                        Self::map_icon_descriptor_to_garmin(icon)
-                    } else {
-                        Self::map_bom_to_garmin_condition(&Some(f.precis.clone()), None)
-                    };
-
-                    BomDailyWeather {
-                        dt: forecast_dt,
-                        temp_min,
-                        temp_max,
-                        condition_code,
-                        description: f.precis.clone(),
-                        pop,
-                        wind_speed: current.wind_speed, // Use current wind as forecast doesn't provide it
-                        wind_deg: current.wind_deg,
-                        humidity: current.humidity,
-                        sunrise: None, // BOM doesn't provide sunrise/sunset in forecasts
-                        sunset: None,
-                    }
-                })
-                .collect()
+        // Use provided daily forecasts, or generate fallback if empty
+        let daily: Vec<BomDailyWeather> = if !daily_forecasts.is_empty() {
+            daily_forecasts
         } else {
-            // Fallback to basic forecast if no data available
-            vec![BomDailyWeather {
-                dt,
-                temp_min: current.temp - 5.0,
-                temp_max: current.temp + 5.0,
-                condition_code: current.condition_code,
-                description: description,
-                pop: 0.0,
-                wind_speed: current.wind_speed,
-                wind_deg: current.wind_deg,
-                humidity: current.humidity,
-                sunrise: None,
-                sunset: None,
-            }]
+            log::warn!("No daily forecasts available, generating fallback");
+            self.generate_daily_forecasts(&current, current_icon_descriptor, dt)
         };
 
         Ok(BomWeatherData {
@@ -719,8 +1065,37 @@ impl BomWeatherService {
             lon: location.lon,
             location_name: location.name.clone(),
             current,
+            hourly,
             daily,
         })
+    }
+
+    /// Generate fallback daily forecasts (only used if API fails)
+    fn generate_daily_forecasts(
+        &self,
+        current: &BomCurrentWeather,
+        description: &str,
+        dt: i64,
+    ) -> Vec<BomDailyWeather> {
+        (0..5)
+            .map(|day| {
+                let forecast_dt = dt + (day * 86400);
+                BomDailyWeather {
+                    dt: forecast_dt,
+                    temp_min: current.temp - 5.0,
+                    temp_max: current.temp + 5.0,
+                    condition_code: current.condition_code,
+                    description: description.to_string(),
+                    pop: 0.0,
+                    wind_speed: current.wind_speed,
+                    wind_deg: current.wind_deg,
+                    humidity: current.humidity,
+                    sunrise: None,
+                    sunset: None,
+                    uv_max: None,
+                }
+            })
+            .collect()
     }
 
     /// Parse cloud coverage from oktas (0-8 scale)
@@ -766,7 +1141,7 @@ impl BomWeatherService {
     }
 
     /// Map BOM icon descriptor to Garmin condition code
-    fn map_icon_descriptor_to_garmin(icon_descriptor: &str) -> i32 {
+    fn map_icon_descriptor_to_garmin(icon_descriptor: &str, is_night: bool) -> i32 {
         let icon = icon_descriptor.to_lowercase();
 
         if icon.contains("storm") || icon.contains("thunder") {
@@ -774,23 +1149,43 @@ impl BomWeatherService {
         } else if icon.contains("shower") || icon.contains("rain") {
             17 // Rain
         } else if icon.contains("drizzle") {
-            11 // Light rain
+            25 // Light rain
         } else if icon.contains("snow") {
             38 // Snow
         } else if icon.contains("fog") || icon.contains("mist") {
             47 // Fog
-        } else if icon.contains("clear") || icon.contains("sunny") {
-            5 // Clear
+        } else if icon.contains("partly")
+            || icon.contains("partly_cloudy")
+            || icon.contains("partly cloudy")
+        {
+            // Check for partly cloudy BEFORE clear/sunny to avoid matching "partly_sunny"
+            if is_night {
+                10 // Partly cloudy (Garmin code 10)
+            } else {
+                13
+            }
         } else if icon.contains("mostly_sunny") || icon.contains("mostly sunny") {
-            6 // Partly cloudy
-        } else if icon.contains("partly_cloudy") || icon.contains("partly cloudy") {
-            8 // Partly cloudy
+            if is_night {
+                10 // Mostly sunny / partly cloudy
+            } else {
+                13
+            }
+        } else if icon.contains("clear") || icon.contains("sunny") {
+            if is_night {
+                4
+            } else {
+                5 // Clear / sunny
+            }
         } else if icon.contains("cloudy") || icon.contains("overcast") {
             15 // Cloudy
         } else if icon.contains("wind") {
-            46 // Windy
+            47 // Windy
         } else {
-            5 // Default to clear
+            if is_night {
+                4
+            } else {
+                5 // Clear / sunny
+            }
         }
     }
 
@@ -801,6 +1196,7 @@ impl BomWeatherService {
             6 => "Partly Cloudy".to_string(),
             7 => "Mostly Cloudy".to_string(),
             8 => "Partly Cloudy".to_string(),
+            10 => "Partly Cloudy".to_string(),
             11 => "Light Rain".to_string(),
             12 => "Rain".to_string(),
             13 => "Snow".to_string(),
@@ -813,56 +1209,6 @@ impl BomWeatherService {
             46 => "Windy".to_string(),
             47 => "Fog".to_string(),
             _ => "Clear".to_string(),
-        }
-    }
-
-    /// Map BOM weather conditions to Garmin icon codes
-    fn map_bom_to_garmin_condition(weather: &Option<String>, cloud_oktas: Option<i32>) -> i32 {
-        let condition = weather.as_deref().unwrap_or("").to_lowercase();
-
-        // Thunderstorm
-        if condition.contains("thunder") {
-            return 27;
-        }
-
-        // Rain
-        if condition.contains("rain")
-            || condition.contains("shower")
-            || condition.contains("drizzle")
-        {
-            if condition.contains("heavy") {
-                return 17;
-            }
-            return 17;
-        }
-
-        // Snow
-        if condition.contains("snow") {
-            return 38;
-        }
-
-        // Fog/Mist
-        if condition.contains("fog") || condition.contains("mist") || condition.contains("haze") {
-            return 47;
-        }
-
-        // Dust/Smoke
-        if condition.contains("dust") || condition.contains("smoke") {
-            return 47;
-        }
-
-        // Wind
-        if condition.contains("windy") {
-            return 46;
-        }
-
-        // Cloud coverage based on oktas
-        match cloud_oktas {
-            Some(0..=1) => 5,  // Clear/Sunny
-            Some(2..=4) => 8,  // Partly cloudy
-            Some(5..=7) => 15, // Cloudy
-            Some(8) => 15,     // Overcast
-            _ => 5,            // Default to sunny
         }
     }
 

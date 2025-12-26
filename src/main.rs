@@ -1707,7 +1707,7 @@ struct AsyncMessageHandler {
 }
 
 /// Maximum protobuf data size per PROTOBUF_RESPONSE chunk (tested on Garmin devices)
-const MAX_PROTOBUF_CHUNK_SIZE: usize = 375;
+const MAX_PROTOBUF_CHUNK_SIZE: usize = 1500;
 
 impl AsyncMessageHandler {
     fn new() -> Self {
