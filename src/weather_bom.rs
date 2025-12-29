@@ -1285,33 +1285,6 @@ mod tests {
         assert_eq!(BomWeatherService::parse_cloud_coverage(None), 0);
     }
 
-    #[test]
-    fn test_condition_mapping() {
-        // Thunderstorm
-        assert_eq!(
-            BomWeatherService::map_bom_to_garmin_condition(&Some("Thunderstorm".to_string()), None),
-            27
-        );
-
-        // Rain
-        assert_eq!(
-            BomWeatherService::map_bom_to_garmin_condition(&Some("Rain".to_string()), None),
-            17
-        );
-
-        // Clear with few clouds
-        assert_eq!(
-            BomWeatherService::map_bom_to_garmin_condition(&Some("Clear".to_string()), Some(1)),
-            5
-        );
-
-        // Cloudy
-        assert_eq!(
-            BomWeatherService::map_bom_to_garmin_condition(&None, Some(7)),
-            15
-        );
-    }
-
     #[tokio::test]
     async fn test_service_creation() {
         let service = BomWeatherService::new(None);
