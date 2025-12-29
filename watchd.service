@@ -1,0 +1,39 @@
+[Unit]
+Description=Linux dameon to support Garmin watches and provide paired phone features
+Documentation=https://github.com/alistair23/watchd
+After=graphical-session.target bluetooth.target dbus.service
+Wants=bluetooth.target network-online.target
+
+[Service]
+Type=simple
+Restart=on-failure
+
+ExecStart=/usr/bin/watchd <MAC> --enable-dedup --enable-calendar-sync
+
+# Restart policy - the service will auto-reconnect internally, but systemd can restart on crashes
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=watchd
+
+# Security hardening
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+# Environment
+Environment="RUST_LOG=info"
+# Uncomment for more detailed logging:
+# Environment="RUST_LOG=debug"
+
+# DBus access is required for notification monitoring
+Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus"
+
+[Install]
+WantedBy=default.target
