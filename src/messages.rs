@@ -335,16 +335,6 @@ impl MessageParser {
 
     fn parse_notification_control(data: &[u8]) -> Result<GfdiMessage> {
         // Debug: log the raw data
-        eprintln!(
-            "🔍 parse_notification_control received {} bytes",
-            data.len()
-        );
-        if data.len() <= 20 {
-            eprintln!("   Data: {:02X?}", data);
-        } else {
-            eprintln!("   First 20 bytes: {:02X?}", &data[..20]);
-        }
-
         if data.len() < 7 {
             return Err(GarminError::InvalidMessage(
                 "NotificationControl message too short".to_string(),
@@ -353,9 +343,6 @@ impl MessageParser {
 
         let command = data[0];
         let notification_id = i32::from_le_bytes([data[1], data[2], data[3], data[4]]);
-
-        eprintln!("   Command: {}", command);
-        eprintln!("   Notification ID: {}", notification_id);
 
         // Handle PERFORM_NOTIFICATION_ACTION (command 128)
         if command == 128 {
@@ -366,7 +353,6 @@ impl MessageParser {
             }
 
             let action_id = data[5];
-            eprintln!("   Action ID: {}", action_id);
 
             // Parse null-terminated action string (if present)
             // Action string is only present for reply actions, not for dismiss
@@ -382,7 +368,6 @@ impl MessageParser {
                                 && s.chars().all(|c| !c.is_control() || c == '\n' || c == '\r')
                             {
                                 action_string = Some(s.to_string());
-                                eprintln!("   Action String: {:?}", s);
                             }
                         }
                     }
@@ -404,14 +389,10 @@ impl MessageParser {
         let mut attributes = Vec::new();
         let mut offset = 5;
 
-        for i in 0..data.len() {
+        for _i in 0..data.len() {
             if offset + 3 > data.len() {
                 // Watch claimed more attributes than provided in packet
                 // This is normal - packet may be truncated due to MTU or watch only needs subset
-                eprintln!(
-                    "   ℹ️  Packet contains {} complete attributes",
-                    attributes.len()
-                );
                 break;
             }
             let attr_id = data[offset];
@@ -435,7 +416,6 @@ impl MessageParser {
             }
 
             let max_len = u16::from_le_bytes([data[offset + 1], data[offset + 2]]);
-            eprintln!("   Attribute {}: id={}, max_len={}", i, attr_id, max_len);
             attributes.push((attr_id, max_len));
             offset += 3;
         }
@@ -1274,8 +1254,6 @@ impl MessageGenerator {
         let mut message_size_entry: Option<(u8, u16)> = None;
 
         for (attr_id, max_len) in requested_attributes {
-            eprintln!("🔍 attr_id: {attr_id}");
-
             // Save MESSAGE_SIZE for last
             if *attr_id == 4 {
                 message_size_entry = Some((*attr_id, *max_len));
@@ -1333,8 +1311,6 @@ impl MessageGenerator {
             payload.extend_from_slice(truncated.as_bytes());
         }
 
-        eprintln!("🔍 message_size_entry: {message_size_entry:?}");
-
         // Now process MESSAGE_SIZE last (Java does this to match protocol expectations)
         if let Some((attr_id, max_len)) = message_size_entry {
             // MESSAGE_SIZE: Length of the body as a string
@@ -1346,8 +1322,6 @@ impl MessageGenerator {
             } else {
                 value
             };
-
-            eprintln!("🔍 Adding MESSAGE_SIZE: {truncated}");
 
             // Write attribute: [id][length][value]
             payload.push(attr_id);

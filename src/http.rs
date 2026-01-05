@@ -247,7 +247,7 @@ impl HttpRequest {
                                 .map(|b| format!("{:02X}", b))
                                 .collect::<Vec<_>>()
                                 .join(" ");
-                            println!("      Header data hex (first 100 bytes): {}", header_hex);
+                            debug!("      Header data hex (first 100 bytes): {}", header_hex);
 
                             // Pass the complete header data to garmin_json::decode
                             // The decoder expects the full format including magic bytes
@@ -1048,8 +1048,8 @@ impl HttpResponse {
             .map(|b| format!("{:02X}", b))
             .collect::<Vec<_>>()
             .join(" ");
-        println!("      Raw ConnectIQHTTPResponse hex: {}", connectiq_hex);
-        println!(
+        debug!("      Raw ConnectIQHTTPResponse hex: {}", connectiq_hex);
+        debug!(
             "      ConnectIQHTTPResponse size: {} bytes",
             connectiq_response.len()
         );
@@ -1067,25 +1067,6 @@ impl HttpResponse {
         let smart_proto_len_varint = encode_varint(http_service.len());
         smart_proto.extend_from_slice(&smart_proto_len_varint);
         smart_proto.extend_from_slice(&http_service);
-
-        println!("   📋 HttpService:");
-        println!("      Tag: 0x{:02X}", (2 << 3) | 2);
-        println!(
-            "      Length varint: {} bytes = {}",
-            http_service_len_varint.len(),
-            connectiq_response.len()
-        );
-        println!("      Payload: {} bytes", connectiq_response.len());
-        println!("      Total: {} bytes", http_service.len());
-        println!("   📋 Smart proto:");
-        println!("      Tag: 0x{:02X}", (2 << 3) | 2);
-        println!(
-            "      Length varint: {} bytes = {}",
-            smart_proto_len_varint.len(),
-            http_service.len()
-        );
-        println!("      Payload: {} bytes", http_service.len());
-        println!("      Total: {} bytes", smart_proto.len());
 
         // Build ProtobufResponse message (ID 5044)
         let mut message = Vec::new();
@@ -1135,19 +1116,6 @@ impl HttpResponse {
         let checksum = compute_checksum(&message);
         message.extend_from_slice(&checksum.to_le_bytes());
 
-        println!("   📋 Final ConnectIQ ProtobufResponse:");
-        println!("      Total message size: {} bytes", message.len());
-        println!(
-            "      Breakdown: size(2) + header(16) + payload({}) + checksum(2)",
-            smart_proto.len()
-        );
-        println!(
-            "      Calculated: 2 + 16 + {} + 2 = {}",
-            smart_proto.len(),
-            2 + 16 + smart_proto.len() + 2
-        );
-        println!("      Checksum: 0x{:04X}", checksum);
-
         Ok(message)
     }
 }
@@ -1160,26 +1128,26 @@ pub async fn handle_http_request_with_weather(
     request: &HttpRequest,
     weather_provider: Option<&UnifiedWeatherProvider>,
 ) -> HttpResponse {
-    println!(
+    debug!(
         "🌐 HTTP Request: {} {}",
         request.method.as_str(),
         request.path
     );
-    println!("   Full URL: {}", request.url);
+    debug!("   Full URL: {}", request.url);
 
     // Check if this URL should be blocked
     if garmin_weather_api::is_garmin_blocked_url(&request.url) {
-        println!("   🚫 Blocking request to Garmin service");
+        info!("   🚫 Blocking request to Garmin service");
         return garmin_weather_api::handle_garmin_blocked_request(request);
     }
 
     // Check if this is a Garmin weather API request that should be intercepted
     if let Some(provider) = weather_provider {
         if garmin_weather_api::is_garmin_weather_api(&request.url) {
-            println!("   🎯 Intercepting Garmin weather API request");
+            info!("   🎯 Intercepting Garmin weather API request");
             match garmin_weather_api::handle_garmin_weather_request(request, provider).await {
                 Ok(response) => {
-                    println!(
+                    debug!(
                         "   ✅ Weather API handled locally, status: {}",
                         response.status
                     );
@@ -1196,11 +1164,11 @@ pub async fn handle_http_request_with_weather(
     // Proxy the request to the internet
     match proxy_http_request(request).await {
         Ok(response) => {
-            println!("   ✅ Proxied successfully, status: {}", response.status);
+            debug!("   ✅ Proxied successfully, status: {}", response.status);
             response
         }
         Err(e) => {
-            eprintln!("   ❌ Proxy error: {}", e);
+            error!("   ❌ Proxy error: {}", e);
             HttpResponse::internal_error()
                 .with_json_body(&format!(r#"{{"error":"Proxy failed: {}"}}"#, e))
         }
@@ -1209,19 +1177,19 @@ pub async fn handle_http_request_with_weather(
 
 /// Proxy an HTTP request to the actual internet destination
 async fn proxy_http_request(request: &HttpRequest) -> Result<HttpResponse> {
-    println!("   🔄 Proxying to: {}", request.url);
-    println!("   📋 Request details:");
-    println!("      Method: {}", request.method.as_str());
-    println!("      Headers: {} total", request.headers.len());
+    debug!("   🔄 Proxying to: {}", request.url);
+    debug!("   📋 Request details:");
+    debug!("      Method: {}", request.method.as_str());
+    debug!("      Headers: {} total", request.headers.len());
     for (key, value) in &request.headers {
         let value_preview = if value.len() > 50 {
             format!("{}... ({} bytes)", &value[..50], value.len())
         } else {
             value.clone()
         };
-        println!("         {}: {}", key, value_preview);
+        debug!("         {}: {}", key, value_preview);
     }
-    println!("      Body: {} bytes", request.body.len());
+    debug!("      Body: {} bytes", request.body.len());
     if !request.body.is_empty() {
         let body_preview = if request.body.len() > 200 {
             format!(
@@ -1232,8 +1200,8 @@ async fn proxy_http_request(request: &HttpRequest) -> Result<HttpResponse> {
         } else {
             String::from_utf8_lossy(&request.body).to_string()
         };
-        println!("      Body content: {}", body_preview);
-        println!(
+        debug!("      Body content: {}", body_preview);
+        debug!(
             "      Body hex (first 64 bytes): {:02X?}",
             &request.body[..std::cmp::min(64, request.body.len())]
         );
@@ -1271,9 +1239,7 @@ async fn proxy_http_request(request: &HttpRequest) -> Result<HttpResponse> {
             // Skip host, connection, and accept-encoding headers
             // We handle compression ourselves, not the remote server
             if key_lower == "accept-encoding" {
-                println!(
-                    "   ℹ️  Skipping accept-encoding header (will compress ourselves if needed)"
-                );
+                info!("   ℹ️  Skipping accept-encoding header (will compress ourselves if needed)");
             }
             continue;
         }
@@ -1281,7 +1247,7 @@ async fn proxy_http_request(request: &HttpRequest) -> Result<HttpResponse> {
         // Validate header name and value before adding
         // Header names must be ASCII and non-empty
         if key.is_empty() || !key.chars().all(|c| c.is_ascii() && !c.is_control()) {
-            println!("   ⚠️  Skipping invalid header name: {:?}", key);
+            error!("   ⚠️  Skipping invalid header name: {:?}", key);
             continue;
         }
 
@@ -1289,7 +1255,7 @@ async fn proxy_http_request(request: &HttpRequest) -> Result<HttpResponse> {
         match reqwest::header::HeaderName::from_bytes(key.as_bytes()) {
             Ok(header_name) => match reqwest::header::HeaderValue::from_str(value) {
                 Ok(header_value) => {
-                    println!(
+                    debug!(
                         "   ✅ Adding header: {} = {}",
                         key,
                         if value.len() > 50 {
@@ -1301,40 +1267,40 @@ async fn proxy_http_request(request: &HttpRequest) -> Result<HttpResponse> {
                     req_builder = req_builder.header(header_name, header_value);
                 }
                 Err(e) => {
-                    println!(
+                    error!(
                         "   ⚠️  Skipping header '{}' with invalid value: {} (error: {})",
                         key, value, e
                     );
-                    println!("      Value bytes: {:02X?}", value.as_bytes());
+                    debug!("      Value bytes: {:02X?}", value.as_bytes());
                 }
             },
             Err(e) => {
-                println!("   ⚠️  Skipping invalid header name '{}': {}", key, e);
-                println!("      Name bytes: {:02X?}", key.as_bytes());
+                debug!("   ⚠️  Skipping invalid header name '{}': {}", key, e);
+                debug!("      Name bytes: {:02X?}", key.as_bytes());
             }
         }
     }
 
     // Add body if present
     if !final_body.is_empty() {
-        println!("   📦 Adding body to request: {} bytes", final_body.len());
+        debug!("   📦 Adding body to request: {} bytes", final_body.len());
         req_builder = req_builder.body(final_body.clone());
     } else {
-        println!("   ℹ️  No body to send (body is empty)");
+        debug!("   ℹ️  No body to send (body is empty)");
     }
 
     // Send the request
-    println!("   📤 Sending request to remote server...");
+    debug!("   📤 Sending request to remote server...");
 
     // Build the request to inspect it before sending
     let built_request = req_builder
         .build()
         .map_err(|e| GarminError::InvalidMessage(format!("Failed to build HTTP request: {}", e)))?;
 
-    println!("   🔍 ACTUAL REQUEST BEING SENT:");
-    println!("      Method: {}", built_request.method());
-    println!("      URL: {}", built_request.url());
-    println!("      Headers ({} total):", built_request.headers().len());
+    debug!("   🔍 ACTUAL REQUEST BEING SENT:");
+    debug!("      Method: {}", built_request.method());
+    debug!("      URL: {}", built_request.url());
+    debug!("      Headers ({} total):", built_request.headers().len());
     for (name, value) in built_request.headers() {
         let value_str = value.to_str().unwrap_or("<binary>");
         let value_preview = if value_str.len() > 60 {
@@ -1342,16 +1308,12 @@ async fn proxy_http_request(request: &HttpRequest) -> Result<HttpResponse> {
         } else {
             value_str.to_string()
         };
-        println!("         {}: {}", name, value_preview);
+        debug!("         {}: {}", name, value_preview);
     }
     if let Some(body) = built_request.body() {
-        println!(
-            "      Body: {} bytes",
-            body.as_bytes().map(|b| b.len()).unwrap_or(0)
-        );
-        println!("      Body: {body:?}");
+        debug!("      Body: {body:?}");
     } else {
-        println!("      Body: None");
+        debug!("      Body: None");
     }
 
     let response = client
@@ -1361,9 +1323,9 @@ async fn proxy_http_request(request: &HttpRequest) -> Result<HttpResponse> {
 
     // Extract status
     let status = response.status().as_u16();
-    println!("   📥 Received response: {}", status);
+    debug!("   📥 Received response: {}", status);
     if status >= 400 {
-        println!("   ⚠️  HTTP error response: {}", status);
+        error!("   ⚠️  HTTP error response: {}", status);
     }
 
     // Extract headers
@@ -1381,15 +1343,15 @@ async fn proxy_http_request(request: &HttpRequest) -> Result<HttpResponse> {
         .map_err(|e| GarminError::InvalidMessage(format!("Failed to read response body: {}", e)))?
         .to_vec();
 
-    println!("   📦 Response body size: {} bytes", body.len());
+    debug!("   📦 Response body size: {} bytes", body.len());
 
     // Check if body is text or binary (e.g., gzip-compressed)
     if let Ok(body_text) = str::from_utf8(&body) {
         // Body is valid UTF-8 text
         if body.len() <= 500 {
-            println!("   📦 Response body (text): {}", body_text);
+            debug!("   📦 Response body (text): {}", body_text);
         } else {
-            println!(
+            debug!(
                 "   📦 Response body (text): {}... ({} bytes total)",
                 &body_text[..500.min(body_text.len())],
                 body.len()
@@ -1397,7 +1359,7 @@ async fn proxy_http_request(request: &HttpRequest) -> Result<HttpResponse> {
         }
     } else {
         // Body is binary (likely compressed)
-        println!("   📦 Response body: <binary data, {} bytes>", body.len());
+        debug!("   📦 Response body: <binary data, {} bytes>", body.len());
         if body.len() > 0 {
             let preview_len = 32.min(body.len());
             let hex_preview: String = body[..preview_len]
@@ -1405,7 +1367,7 @@ async fn proxy_http_request(request: &HttpRequest) -> Result<HttpResponse> {
                 .map(|b| format!("{:02X}", b))
                 .collect::<Vec<_>>()
                 .join(" ");
-            println!("   📦 First {} bytes (hex): {}", preview_len, hex_preview);
+            debug!("   📦 First {} bytes (hex): {}", preview_len, hex_preview);
         }
     }
 
@@ -1790,7 +1752,6 @@ fn convert_oauth_to_form_encoded(
     if let Some(obj) = json_value.as_object() {
         if obj.contains_key("grant_type") {
             debug!("Detected OAuth request, converting to form-encoded format");
-            println!("      🔐 OAuth request detected, converting to form-encoded");
 
             // Helper function for percent encoding
             fn percent_encode(s: &str) -> String {
@@ -1826,7 +1787,6 @@ fn convert_oauth_to_form_encoded(
 
             let form_body = form_parts.join("&");
             debug!("Form-encoded body: {}", form_body);
-            println!("      Form body: {}", form_body);
 
             // Update Content-Type header
             headers.insert(

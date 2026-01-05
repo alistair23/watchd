@@ -11,6 +11,7 @@
 
 use crate::http::{HttpRequest, HttpResponse};
 use crate::weather_provider::{UnifiedWeatherData, UnifiedWeatherProvider};
+use log::{debug, error, info};
 use serde::Serialize;
 
 /// Check if a URL is a Garmin weather API request that should be intercepted
@@ -26,9 +27,9 @@ pub fn is_garmin_blocked_url(url: &str) -> bool {
 
 /// Handle blocked Garmin request by returning an error response
 pub fn handle_garmin_blocked_request(request: &HttpRequest) -> HttpResponse {
-    println!("🚫 Blocking Garmin request");
-    println!("   URL: {}", request.url);
-    println!("   Path: {}", request.path);
+    info!("🚫 Blocking Garmin request");
+    info!("   URL: {}", request.url);
+    info!("   Path: {}", request.path);
 
     // Return HTTP 403 Forbidden
     let mut response = HttpResponse::new(403);
@@ -67,12 +68,12 @@ pub async fn handle_garmin_weather_request(
     request: &HttpRequest,
     weather_provider: &UnifiedWeatherProvider,
 ) -> Result<HttpResponse, String> {
-    println!("☀️  Intercepting Garmin weather API request");
-    println!("   URL: {}", request.url);
-    println!("   Path: {}", request.path);
+    info!("☀️  Intercepting Garmin weather API request");
+    info!("   URL: {}", request.url);
+    info!("   Path: {}", request.path);
 
     let path = extract_path(&request.url);
-    println!("   Extracted path: {}", path);
+    info!("   Extracted path: {}", path);
 
     // Extract query parameters
     let lat = request
@@ -87,7 +88,7 @@ pub async fn handle_garmin_weather_request(
         .and_then(|s| s.parse::<i32>().ok())
         .ok_or_else(|| "Missing or invalid 'lon' parameter".to_string())?;
 
-    println!("   Coordinates: lat={}, lon={}", lat, lon);
+    debug!("   Coordinates: lat={}, lon={}", lat, lon);
 
     // Fetch weather data synchronously using tokio runtime
     let weather_data = weather_provider
@@ -95,14 +96,14 @@ pub async fn handle_garmin_weather_request(
         .await
         .map_err(|e| format!("Failed to fetch weather: {}", e))?;
 
-    println!("   ✅ Weather data fetched successfully");
-    println!("   Location: {}", weather_data.location_name);
-    println!(
+    debug!("   ✅ Weather data fetched successfully");
+    debug!("   Location: {}", weather_data.location_name);
+    debug!(
         "   Current temp: {:.1}°C",
         weather_data.current.temp - 273.15
     );
-    println!("   Hourly forecasts: {}", weather_data.hourly.len());
-    println!("   Daily forecasts: {}", weather_data.daily.len());
+    debug!("   Hourly forecasts: {}", weather_data.hourly.len());
+    debug!("   Daily forecasts: {}", weather_data.daily.len());
 
     // Determine which endpoint was requested based on path
     let response_json = if path.contains("/weather/v1/current")
@@ -119,11 +120,11 @@ pub async fn handle_garmin_weather_request(
     } else {
         // Default to handling it as a general forecast request
         // The watch might request /weather/v2/forecast without a specific endpoint
-        println!("   ℹ️  Unknown weather path, defaulting to daily forecast");
+        error!("   ℹ️  Unknown weather path, defaulting to daily forecast");
         handle_daily_forecast(&request, &weather_data)?
     };
 
-    println!(
+    debug!(
         "   📤 Sending weather response ({} bytes)",
         response_json.len()
     );
@@ -212,7 +213,7 @@ fn handle_hourly_forecast(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(12);
 
-    println!(
+    debug!(
         "   📊 Processing hourly forecasts: {} available, requesting {}",
         weather.hourly.len(),
         duration
@@ -229,7 +230,7 @@ fn handle_hourly_forecast(
             use chrono::{TimeZone, Utc};
             let dt_utc = Utc.timestamp_opt(hourly.dt, 0).unwrap();
             let dt_local = Utc.timestamp_opt(hourly.dt + (10 * 3600), 0).unwrap();
-            println!(
+            debug!(
                 "   Hour {}: dt={}, UTC time={}, Local(+10)={}, temp={:.1}°C, condition={}",
                 i,
                 hourly.dt,
@@ -271,7 +272,7 @@ fn handle_hourly_forecast(
         hourly_forecasts.push(forecast);
     }
 
-    println!(
+    debug!(
         "   ✅ Returning {} hourly forecasts",
         hourly_forecasts.len()
     );
@@ -322,7 +323,7 @@ fn handle_daily_forecast(
         if i < 3 {
             use chrono::{TimeZone, Utc};
             let dt_utc = Utc.timestamp_opt(daily.dt, 0).unwrap();
-            println!(
+            debug!(
                 "   Daily {}: date={}, day={}, desc='{}', icon={}, temp_max={:.1}°C",
                 i,
                 dt_utc.format("%Y-%m-%d"),

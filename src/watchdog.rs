@@ -8,6 +8,7 @@
 //! - Provides health metrics and diagnostics
 
 use bluer::Device;
+use log::{debug, error, info};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -175,7 +176,6 @@ impl WatchdogManager {
         let mut state = self.state.lock().await;
         let now = Instant::now();
         state.last_rx = Some(now);
-        eprintln!("🟢 Watchdog: RX traffic recorded at {:?}", now);
 
         // Update health status if we were degraded
         if state.health_status != HealthStatus::Healthy && !state.is_reconnecting {
@@ -327,7 +327,7 @@ impl WatchdogManager {
 
         // Don't reconnect if already reconnecting
         if state.is_reconnecting {
-            println!("Don't reconnect if already reconnecting");
+            info!("Don't reconnect if already reconnecting");
             return None;
         }
 
@@ -343,9 +343,9 @@ impl WatchdogManager {
 
         // Check RX timeout
         if let Some(last_rx) = state.last_rx {
-            println!("last_rx: {last_rx:?}");
+            debug!("last_rx: {last_rx:?}");
             let elapsed = now.duration_since(last_rx);
-            println!("elapsed: {elapsed:?}");
+            debug!("elapsed: {elapsed:?}");
             if elapsed >= self.config.rx_timeout {
                 return Some(ReconnectReason::RxTimeout);
             }
@@ -424,7 +424,7 @@ impl WatchdogManager {
             // Log status periodically (every 5 minutes - not noisy)
             if last_log.elapsed() >= Duration::from_secs(300) {
                 let metrics = self.get_metrics().await;
-                println!(
+                debug!(
                     "   💓 Watchdog status: {} | RX: {:?} ago | Reconnects: {}",
                     health, metrics.last_rx_elapsed, metrics.total_reconnects
                 );
@@ -435,23 +435,12 @@ impl WatchdogManager {
             if let Some(reason) = self.should_reconnect(is_connected).await {
                 // Check if we've exceeded max attempts
                 if self.is_max_attempts_exceeded().await {
-                    eprintln!("⚠️  Maximum reconnection attempts exceeded!");
+                    error!("⚠️  Maximum reconnection attempts exceeded!");
                     return Err("Maximum reconnection attempts exceeded".into());
                 }
 
                 // Get backoff duration
                 let backoff = self.get_and_advance_backoff().await;
-                let attempts = {
-                    let state = self.state.lock().await;
-                    state.reconnect_attempts
-                };
-
-                eprintln!("\n⚠️  Connection issue detected: {}", reason);
-                eprintln!(
-                    "   🔄 Attempting reconnection (attempt {}/{})...",
-                    attempts, self.config.max_reconnect_attempts
-                );
-                eprintln!("   ⏱️  Backing off for {:?}", backoff);
 
                 // Mark as reconnecting
                 self.mark_reconnecting(reason).await;
@@ -462,11 +451,11 @@ impl WatchdogManager {
                 // Attempt reconnection
                 match reconnect_callback(reason).await {
                     Ok(_) => {
-                        println!("   ✅ Reconnection successful!");
+                        info!("   ✅ Reconnection successful!");
                         self.mark_connected().await;
                     }
                     Err(e) => {
-                        eprintln!("   ❌ Reconnection failed: {}", e);
+                        error!("   ❌ Reconnection failed: {}", e);
                         self.mark_disconnected().await;
 
                         // Continue loop to try again
@@ -476,7 +465,7 @@ impl WatchdogManager {
             } else if health == HealthStatus::Degraded {
                 // Warn about degraded health
                 let metrics = self.get_metrics().await;
-                eprintln!(
+                error!(
                     "⚠️  Connection degraded - RX: {:?} ago",
                     metrics.last_rx_elapsed
                 );

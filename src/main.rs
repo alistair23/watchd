@@ -388,13 +388,6 @@ impl NotificationUpdateMessageBuilder {
         }
         message.push(phone_flags);
 
-        println!("   📊 NotificationUpdate flags:");
-        println!("      Category flags: 0x{:02X}", category_flags);
-        println!(
-            "      Phone flags: 0x{:02X} (has_actions={}, has_picture={})",
-            phone_flags, self.has_actions, self.has_picture
-        );
-
         message
     }
 }
@@ -477,15 +470,10 @@ impl GarminNotificationHandler {
         };
 
         if !notifications_to_remove.is_empty() {
-            println!(
-                "🧹 Cleaning up {} old unretrieved notifications",
-                notifications_to_remove.len()
-            );
-
             // Send remove commands to watch for each notification
             for (id, _notif_type) in notifications_to_remove {
                 if let Err(e) = self.remove_notification(id).await {
-                    eprintln!("   ⚠️  Failed to remove notification {}: {}", id, e);
+                    error!("   ⚠️  Failed to remove notification {}: {}", id, e);
                 }
             }
         }
@@ -497,7 +485,7 @@ impl GarminNotificationHandler {
         };
 
         if stored_count > 30 {
-            println!(
+            error!(
                 "🧹 Too many notifications ({}), clearing all and resetting counts",
                 stored_count
             );
@@ -512,7 +500,7 @@ impl GarminNotificationHandler {
 
             for (id, _notif_type) in all_notifications {
                 if let Err(e) = self.remove_notification(id).await {
-                    eprintln!("   ⚠️  Failed to remove notification {}: {}", id, e);
+                    error!("   ⚠️  Failed to remove notification {}: {}", id, e);
                 }
             }
 
@@ -522,7 +510,7 @@ impl GarminNotificationHandler {
 
     /// Remove a notification from the watch
     pub async fn remove_notification(&self, notification_id: i32) -> types::Result<()> {
-        println!(
+        debug!(
             "🗑️  Removing notification ID {} from watch",
             notification_id
         );
@@ -568,7 +556,7 @@ impl GarminNotificationHandler {
 
         if !is_connected {
             // Store for later replay
-            println!(
+            info!(
                 "⏸️  Watch disconnected - queueing notification {} for later",
                 notification.id
             );
@@ -581,7 +569,7 @@ impl GarminNotificationHandler {
 
         // Cleanup old notifications periodically
         self.cleanup_old_notifications().await;
-        println!(
+        info!(
             "📨 Sending {} notification (ID: {})",
             match notification.notification_type {
                 NotificationType::GenericPhone => "Phone",
@@ -596,16 +584,6 @@ impl GarminNotificationHandler {
             },
             notification.id
         );
-
-        if let Some(ref sender) = notification.sender {
-            println!("   From: {}", sender);
-        }
-        if let Some(ref title) = notification.title {
-            println!("   Title: {}", title);
-        }
-        if let Some(ref body) = notification.body {
-            println!("   Body: {}", body);
-        }
 
         // Calculate actual count of unretrieved notifications of this type
         // This gives the watch an accurate count instead of an ever-increasing number
@@ -623,27 +601,11 @@ impl GarminNotificationHandler {
             ((unretrieved_count + 1).min(50), unretrieved)
         };
 
-        println!(
-            "   📊 Unretrieved {} notifications: {}",
-            match notification.notification_type {
-                NotificationType::GenericPhone => "Phone",
-                NotificationType::GenericSms => "SMS",
-                NotificationType::GenericEmail => "Email",
-                NotificationType::GenericChat => "Chat",
-                NotificationType::GenericSocial => "Social",
-                NotificationType::GenericNavigation => "Navigation",
-                NotificationType::GenericCalendar => "Calendar",
-                NotificationType::GenericAlarmClock => "Alarm",
-                NotificationType::Generic => "Generic",
-            },
-            count
-        );
-
         // If count is >= 5, clean up old unretrieved notifications
         // BUT only remove notifications that are at least 60 seconds old
         // The watch can take 30-60 seconds to request notification attributes
         if count >= 5 {
-            println!(
+            error!(
                 "   🧹 Count too high ({}), removing OLD unretrieved notifications (>60s)",
                 count
             );
@@ -665,12 +627,12 @@ impl GarminNotificationHandler {
 
                 if is_old {
                     if let Err(e) = self.remove_notification(*id).await {
-                        eprintln!("   ⚠️  Failed to remove notification {}: {}", id, e);
+                        error!("   ⚠️  Failed to remove notification {}: {}", id, e);
                     } else {
                         removed_count += 1;
                     }
                 } else {
-                    println!(
+                    info!(
                         "   ⏳ Keeping notification {} (too recent, watch may still request it)",
                         id
                     );
@@ -678,13 +640,13 @@ impl GarminNotificationHandler {
             }
 
             if removed_count > 0 {
-                println!(
+                info!(
                     "   ✅ Removed {} old notifications, {} recent ones kept",
                     removed_count,
                     total_unretrieved - removed_count
                 );
             } else {
-                println!("   ℹ️  No old notifications to remove, all are recent");
+                debug!("   ℹ️  No old notifications to remove, all are recent");
             }
             let count = 1;
 
@@ -708,12 +670,12 @@ impl GarminNotificationHandler {
                 .await
             {
                 Ok(_) => {
-                    println!("   ✅ Notification sent successfully");
+                    debug!("   ✅ Notification sent successfully");
                 }
                 Err(e) => {
                     let err_msg = format!("{}", e);
                     if err_msg.contains("Not connected") || err_msg.contains("not connected") {
-                        eprintln!("❌ BLE connection lost - triggering immediate watchdog restart");
+                        debug!("❌ BLE connection lost - triggering immediate watchdog restart");
                         // Mark as disconnected so watchdog triggers immediately
                         let watchdog = self.watchdog.clone();
                         tokio::task::block_in_place(|| {
@@ -755,12 +717,12 @@ impl GarminNotificationHandler {
             .await
         {
             Ok(_) => {
-                println!("   ✅ Notification sent successfully");
+                info!("   ✅ Notification sent successfully");
             }
             Err(e) => {
                 let err_msg = format!("{}", e);
                 if err_msg.contains("Not connected") || err_msg.contains("not connected") {
-                    eprintln!("❌ BLE connection lost during notification send");
+                    debug!("❌ BLE connection lost during notification send");
 
                     // Mark handler and watchdog as disconnected
                     self.set_connected(false);
@@ -770,7 +732,7 @@ impl GarminNotificationHandler {
                     });
 
                     // Queue this notification for replay after reconnection
-                    eprintln!(
+                    info!(
                         "⏸️  Queueing notification {} for replay after reconnect",
                         notification.id
                     );
@@ -792,10 +754,6 @@ impl GarminNotificationHandler {
             stored.insert(notification_id, notification);
         }
 
-        println!(
-            "✅ Notification sent successfully (ID: {})",
-            notification_id
-        );
         Ok(())
     }
 
@@ -811,25 +769,20 @@ impl GarminNotificationHandler {
             return Ok(());
         }
 
-        println!(
+        info!(
             "\n🔄 Replaying {} missed notifications...",
             notifications.len()
         );
 
         for notif in notifications {
-            println!(
-                "   📨 Replaying notification ID {}: {}",
-                notif.id,
-                notif.title.as_deref().unwrap_or("")
-            );
             if let Err(e) = self.on_notification(notif).await {
-                eprintln!("   ⚠️  Failed to replay notification: {}", e);
+                error!("   ⚠️  Failed to replay notification: {}", e);
             }
             // Small delay between notifications
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        println!("   ✅ Finished replaying missed notifications\n");
+        debug!("   ✅ Finished replaying missed notifications\n");
         Ok(())
     }
 
@@ -849,26 +802,19 @@ impl GarminNotificationHandler {
         command: u8,
         attributes: &[(u8, u16)],
     ) -> types::Result<()> {
-        println!(
-            "📱 Handling NotificationControl: ID={}, Command={}",
-            notification_id, command
-        );
-
         // Command 0 = GET_NOTIFICATION_ATTRIBUTES
         if command == 0 {
             // Continue with attribute retrieval (existing code below)
         }
         // Command 2 = PERFORM_LEGACY_NOTIFICATION_ACTION (legacy dismiss/action)
         else if command == 2 {
-            println!("   🗑️  PERFORM_LEGACY_NOTIFICATION_ACTION - legacy action");
-
             // Remove notification from our cache
             {
                 let mut stored = self.stored_notifications.lock().unwrap();
                 if stored.remove(&notification_id).is_some() {
-                    println!("   ✅ Notification {} removed from cache", notification_id);
+                    debug!("   ✅ Notification {} removed from cache", notification_id);
                 } else {
-                    println!("   ⚠️  Notification {} not in cache", notification_id);
+                    error!("   ⚠️  Notification {} not in cache", notification_id);
                 }
             }
 
@@ -885,7 +831,6 @@ impl GarminNotificationHandler {
                 .send_message("notification_action_ack", &response)
                 .await?;
 
-            println!("   ✅ Legacy action ACK sent to watch");
             return Ok(());
         }
         // Command 128 = PERFORM_NOTIFICATION_ACTION (modern action with action_id)
@@ -1840,11 +1785,11 @@ impl AsyncMessageHandler {
 
         // Build first chunk
         let first_chunk = &protobuf_payload[..MAX_PROTOBUF_CHUNK_SIZE];
-        println!("   📦 First chunk details:");
-        println!("      Start offset: 0");
-        println!("      End offset: {}", MAX_PROTOBUF_CHUNK_SIZE);
-        println!("      Chunk size: {} bytes", first_chunk.len());
-        println!("      First 32 bytes: {}", hex_dump(first_chunk, 32));
+        debug!("   📦 First chunk details:");
+        debug!("      Start offset: 0");
+        debug!("      End offset: {}", MAX_PROTOBUF_CHUNK_SIZE);
+        debug!("      Chunk size: {} bytes", first_chunk.len());
+        debug!("      First 32 bytes: {}", hex_dump(first_chunk, 32));
 
         self.send_protobuf_chunk(request_id, 0, first_chunk, protobuf_payload.len())
             .await
@@ -1858,18 +1803,18 @@ impl AsyncMessageHandler {
         chunk_data: &[u8],
         total_length: usize,
     ) -> types::Result<()> {
-        println!("   📤 Sending protobuf chunk:");
-        println!("      Request ID: {}", request_id);
-        println!("      Offset: {}", data_offset);
-        println!("      Chunk size: {} bytes", chunk_data.len());
-        println!("      Total size: {} bytes", total_length);
-        println!(
+        debug!("   📤 Sending protobuf chunk:");
+        debug!("      Request ID: {}", request_id);
+        debug!("      Offset: {}", data_offset);
+        debug!("      Chunk size: {} bytes", chunk_data.len());
+        debug!("      Total size: {} bytes", total_length);
+        debug!(
             "      Progress: {}/{} bytes ({:.1}%)",
             data_offset + chunk_data.len() as u32,
             total_length,
             ((data_offset + chunk_data.len() as u32) as f64 / total_length as f64) * 100.0
         );
-        println!(
+        debug!(
             "      Chunk data (first 32 bytes): {}",
             hex_dump(chunk_data, 32)
         );
@@ -1906,7 +1851,7 @@ impl AsyncMessageHandler {
         let checksum = compute_crc16(&message);
         message.extend_from_slice(&checksum.to_le_bytes());
 
-        println!("   📤 Chunk message size: {} bytes", message.len());
+        debug!("   📤 Chunk message size: {} bytes", message.len());
 
         // Send the chunk
         self.send_response(&message).await
@@ -1926,16 +1871,16 @@ impl AsyncMessageHandler {
         if let Some(chunk_info) = pending_chunk {
             let next_offset = data_offset as usize + MAX_PROTOBUF_CHUNK_SIZE;
 
-            println!("   📦 Checking for next chunk:");
-            println!("      Request ID: {}", request_id);
-            println!("      Current offset (from ACK): {}", data_offset);
-            println!("      Chunk size sent: {} bytes", MAX_PROTOBUF_CHUNK_SIZE);
-            println!(
+            debug!("   📦 Checking for next chunk:");
+            debug!("      Request ID: {}", request_id);
+            debug!("      Current offset (from ACK): {}", data_offset);
+            debug!("      Chunk size sent: {} bytes", MAX_PROTOBUF_CHUNK_SIZE);
+            debug!(
                 "      Next offset calculation: {} + {} = {}",
                 data_offset, MAX_PROTOBUF_CHUNK_SIZE, next_offset
             );
-            println!("      Total length: {}", chunk_info.total_length);
-            println!(
+            debug!("      Total length: {}", chunk_info.total_length);
+            debug!(
                 "      Remaining: {} bytes",
                 chunk_info.total_length.saturating_sub(next_offset)
             );
@@ -1947,7 +1892,7 @@ impl AsyncMessageHandler {
 
                 // Verify we're not reading beyond bounds
                 if next_offset + chunk_size > chunk_info.complete_payload.len() {
-                    eprintln!(
+                    error!(
                         "   ❌ ERROR: Chunk boundary exceeds payload! offset={}, size={}, total={}",
                         next_offset,
                         chunk_size,
@@ -1959,16 +1904,16 @@ impl AsyncMessageHandler {
                 let next_chunk =
                     &chunk_info.complete_payload[next_offset..next_offset + chunk_size];
 
-                println!(
+                debug!(
                     "   📤 Sending next chunk (offset {}, {} bytes)",
                     next_offset, chunk_size
                 );
-                println!(
+                debug!(
                     "      Extracting bytes: {}..{}",
                     next_offset,
                     next_offset + chunk_size
                 );
-                println!(
+                debug!(
                     "      First 32 bytes of chunk: {}",
                     hex_dump(next_chunk, 32)
                 );
@@ -1982,15 +1927,15 @@ impl AsyncMessageHandler {
                 .await?;
             } else {
                 // All chunks sent, remove from pending
-                println!("   ✅ All chunks sent for request ID {}", request_id);
-                println!("      Final offset: {}", next_offset);
-                println!("      Total transferred: {} bytes", chunk_info.total_length);
+                info!("   ✅ All chunks sent for request ID {}", request_id);
+                info!("      Final offset: {}", next_offset);
+                info!("      Total transferred: {} bytes", chunk_info.total_length);
                 let mut pending = self.pending_protobuf_chunks.lock().unwrap();
                 pending.remove(&request_id);
-                println!("   🎉 Transfer complete! Removed from pending chunks.");
+                debug!("   🎉 Transfer complete! Removed from pending chunks.");
             }
         } else {
-            println!(
+            error!(
                 "   ℹ️  No pending chunk found for request ID {}",
                 request_id
             );
@@ -2024,107 +1969,87 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
             Ok(parsed_message) => {
                 match parsed_message {
                     crate::GfdiMessage::DeviceInformation(dev_info) => {
-                        println!("📱 Received DeviceInformation:");
-                        println!("   Protocol: {}", dev_info.protocol_version);
-                        println!("   Product: {}", dev_info.product_number);
-                        println!("   Unit: {}", dev_info.unit_number);
-                        println!("   SW Version: {}", dev_info.software_version);
-                        println!("   Max Packet: {}", dev_info.max_packet_size);
-                        println!("   Name: {}", dev_info.bluetooth_friendly_name);
-                        println!("   Model: {}", dev_info.device_model);
+                        info!("📱 Received DeviceInformation:");
+                        info!("   Protocol: {}", dev_info.protocol_version);
+                        info!("   Product: {}", dev_info.product_number);
+                        info!("   Unit: {}", dev_info.unit_number);
+                        info!("   SW Version: {}", dev_info.software_version);
+                        info!("   Max Packet: {}", dev_info.max_packet_size);
+                        info!("   Name: {}", dev_info.bluetooth_friendly_name);
+                        info!("   Model: {}", dev_info.device_model);
 
                         // Generate and send response immediately
                         match MessageGenerator::device_information_response(&dev_info) {
                             Ok(response) => {
-                                println!("   ✅ Generated DeviceInformation response");
                                 self.send_response(&response).await?;
-                                println!("   ✅ DeviceInformation response sent!");
                             }
                             Err(e) => {
-                                eprintln!("   ❌ Failed to generate response: {}", e);
+                                error!("   ❌ Failed to generate response: {}", e);
                             }
                         }
                     }
                     crate::GfdiMessage::Configuration(config) => {
-                        println!(
+                        info!(
                             "📱 Received Configuration with {} capabilities",
                             config.capabilities.len()
                         );
 
                         // Mark that we've received Configuration (device is paired)
                         *self.pairing_detected.lock().unwrap() = true;
-                        println!("   🔔 PAIRING DETECTED FLAG SET TO TRUE");
+                        info!("   🔔 PAIRING DETECTED FLAG SET TO TRUE");
 
                         // Generate and send response immediately
                         match MessageGenerator::configuration_response() {
                             Ok(response) => {
-                                println!("   ✅ Generated Configuration response");
-                                println!("   📋 IMPORTANT: Capabilities include:");
-                                println!("      • Capability #10 (CONNECTIQ_HTTP) - HTTP proxy");
-                                println!("      • Capability #28 (GPS_EPHEMERIS_DOWNLOAD) - AGPS");
-                                println!("      • Capability #26 (WEATHER_CONDITIONS) - Weather");
-                                println!("      • All other Garmin capabilities");
-                                println!("   ⚠️  If watch doesn't make HTTP requests:");
-                                println!(
-                                    "      1. Check watch Settings → System → Connectivity → Phone"
-                                );
-                                println!("      2. Enable 'Internet' or 'Connected GPS'");
-                                println!("      3. Try weather widget or GPS activity");
-                                println!("      4. May need to un-pair and re-pair watch");
                                 self.send_response(&response).await?;
-                                println!("   ✅ Configuration response sent!");
                             }
                             Err(e) => {
-                                eprintln!("   ❌ Failed to generate response: {}", e);
+                                error!("   ❌ Failed to generate response: {}", e);
                             }
                         }
 
-                        // Check if we should skip full initialization
-                        println!("   ℹ️  Skip pairing mode - sending minimal essential messages");
-
                         // FIRST: Send Configuration proactively to advertise HTTP capabilities
-                        println!("   📤 Sending Configuration proactively to advertise HTTP capabilities");
+                        info!("   📤 Sending Configuration proactively to advertise HTTP capabilities");
                         match MessageGenerator::configuration_response() {
                             Ok(msg) => {
                                 self.send_response(&msg).await?;
-                                println!("      ✅ Configuration with HTTP capability #10 sent!");
+                                info!("      ✅ Configuration with HTTP capability #10 sent!");
                             }
-                            Err(e) => eprintln!("      ❌ Failed to send Configuration: {}", e),
+                            Err(e) => error!("      ❌ Failed to send Configuration: {}", e),
                         }
 
                         // Send device settings to enable notifications on watch
-                        println!("   📤 Sending SetDeviceSettings (enable notifications)");
+                        info!("   📤 Sending SetDeviceSettings (enable notifications)");
                         match MessageGenerator::set_device_settings(true, true, false) {
                             Ok(msg) => {
                                 self.send_response(&msg).await?;
-                                println!("      ✅ SetDeviceSettings sent");
+                                info!("      ✅ SetDeviceSettings sent");
                             }
                             Err(e) => {
-                                eprintln!("      ❌ Failed to send SetDeviceSettings: {}", e)
+                                error!("      ❌ Failed to send SetDeviceSettings: {}", e)
                             }
                         }
 
                         // Send SYNC_READY to indicate we're ready to sync
-                        println!("   📤 Sending SYNC_READY event");
+                        info!("   📤 Sending SYNC_READY event");
                         match MessageGenerator::system_event(8, 0) {
                             Ok(msg) => {
                                 self.send_response(&msg).await?;
-                                println!("      ✅ SYNC_READY sent");
+                                info!("      ✅ SYNC_READY sent");
                             }
-                            Err(e) => eprintln!("      ❌ Failed to send SYNC_READY: {}", e),
+                            Err(e) => error!("      ❌ Failed to send SYNC_READY: {}", e),
                         }
 
                         // Send HOST_DID_ENTER_FOREGROUND to trigger notification subscription
-                        println!("   📤 Sending HOST_DID_ENTER_FOREGROUND");
+                        info!("   📤 Sending HOST_DID_ENTER_FOREGROUND");
                         match MessageGenerator::system_event(6, 0) {
                             Ok(msg) => {
                                 self.send_response(&msg).await?;
-                                println!("      ✅ HOST_DID_ENTER_FOREGROUND sent");
+                                info!("      ✅ HOST_DID_ENTER_FOREGROUND sent");
                             }
-                            Err(e) => eprintln!(
-                                "      ❌ Failed to send HOST_DID_ENTER_FOREGROUND: {}",
-                                e
-                            ),
+                            Err(e) => {
+                                error!("      ❌ Failed to send HOST_DID_ENTER_FOREGROUND: {}", e)
+                            }
                         }
 
                         // Mark initialization as complete (even if we skipped sending messages)
@@ -2139,34 +2064,34 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                         };
 
                         if is_first_connect {
-                            println!("   🎉 First connect - sending SYNC_COMPLETE");
+                            info!("   🎉 First connect - sending SYNC_COMPLETE");
                             match MessageGenerator::system_event(0, 0) {
                                 Ok(msg) => {
-                                    println!("      ✅ Sending SYNC_COMPLETE event");
+                                    info!("      ✅ Sending SYNC_COMPLETE event");
                                     self.send_response(&msg).await?;
                                 }
-                                Err(e) => eprintln!("      ❌ Failed to send SYNC_COMPLETE: {}", e),
+                                Err(e) => error!("      ❌ Failed to send SYNC_COMPLETE: {}", e),
                             }
                         }
 
-                        println!("   ✅ Minimal initialization complete - watch should now subscribe to notifications");
+                        info!("   ✅ Minimal initialization complete - watch should now subscribe to notifications");
                     }
                     crate::GfdiMessage::CurrentTimeRequest => {
-                        println!("📱 Received CurrentTimeRequest");
+                        info!("📱 Received CurrentTimeRequest");
 
                         match MessageGenerator::current_time_response() {
                             Ok(response) => {
-                                println!("   ✅ Generated CurrentTime response");
+                                info!("   ✅ Generated CurrentTime response");
                                 self.send_response(&response).await?;
-                                println!("   ✅ CurrentTime response sent!");
+                                info!("   ✅ CurrentTime response sent!");
                             }
                             Err(e) => {
-                                eprintln!("   ❌ Failed to generate response: {}", e);
+                                error!("   ❌ Failed to generate response: {}", e);
                             }
                         }
                     }
                     crate::GfdiMessage::NotificationControl(ctrl) => {
-                        println!(
+                        debug!(
                             "📱 Received NotificationControl: ID={}, Command={}",
                             ctrl.notification_id, ctrl.command
                         );
@@ -2183,13 +2108,13 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                                 99 => "BLOCK_APPLICATION".to_string(),
                                 _ => format!("UNKNOWN({})", action_id),
                             };
-                            println!("   Action: {} (id={})", action_name, action_id);
+                            debug!("   Action: {} (id={})", action_name, action_id);
                             if let Some(ref action_string) = ctrl.action_string {
-                                println!("   Action String: {:?}", action_string);
+                                debug!("   Action String: {:?}", action_string);
                             }
                         }
 
-                        println!(
+                        debug!(
                             "   Requested attributes: {} attributes",
                             ctrl.attributes.len()
                         );
@@ -2204,7 +2129,7 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                                 127 => "ACTIONS",
                                 _ => "UNKNOWN",
                             };
-                            println!(
+                            debug!(
                                 "      - {} (id={}, max_len={})",
                                 attr_name, attr_id, max_len
                             );
@@ -2222,23 +2147,23 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                                 )
                                 .await
                             {
-                                eprintln!("   ❌ Failed to handle NotificationControl: {}", e);
+                                error!("   ❌ Failed to handle NotificationControl: {}", e);
                             }
                         } else {
-                            eprintln!("   ❌ Notification handler not available");
+                            error!("   ❌ Notification handler not available");
                         }
                     }
                     crate::GfdiMessage::NotificationSubscription(sub) => {
-                        println!("📱 Received NotificationSubscription:");
-                        println!("   Enable: {}", sub.enable);
-                        println!("   Unknown: {}", sub.unk);
+                        debug!("📱 Received NotificationSubscription:");
+                        debug!("   Enable: {}", sub.enable);
+                        debug!("   Unknown: {}", sub.unk);
 
                         // Generate and send response
                         match MessageGenerator::notification_subscription_response(&sub, true) {
                             Ok(response) => {
-                                println!("   ✅ Generated NotificationSubscription response");
+                                debug!("   ✅ Generated NotificationSubscription response");
                                 self.send_response(&response).await?;
-                                println!("   ✅ NotificationSubscription response sent!");
+                                debug!("   ✅ NotificationSubscription response sent!");
                             }
                             Err(e) => {
                                 eprintln!("   ❌ Failed to generate response: {}", e);
@@ -2246,34 +2171,30 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                         }
                     }
                     crate::GfdiMessage::Synchronization(sync_msg) => {
-                        println!("📱 Received Synchronization:");
-                        println!("   Type: {}", sync_msg.synchronization_type);
-                        println!("   Bitmask: 0x{:016X}", sync_msg.file_type_bitmask);
-                        println!("   Should proceed: {}", sync_msg.should_proceed());
+                        debug!("📱 Received Synchronization:");
+                        debug!("   Type: {}", sync_msg.synchronization_type);
+                        debug!("   Bitmask: 0x{:016X}", sync_msg.file_type_bitmask);
+                        debug!("   Should proceed: {}", sync_msg.should_proceed());
 
                         // Send ACK for synchronization message
                         match MessageGenerator::synchronization_ack() {
                             Ok(response) => {
-                                println!("   ✅ Generated Synchronization ACK");
                                 self.send_response(&response).await?;
-                                println!("   ✅ Synchronization ACK sent!");
 
                                 // If should proceed, send filter message
                                 if sync_msg.should_proceed() {
                                     match MessageGenerator::filter_message(3) {
                                         Ok(filter) => {
-                                            println!("   ✅ Generated Filter message");
                                             self.send_response(&filter).await?;
-                                            println!("   ✅ Filter message sent!");
                                         }
                                         Err(e) => {
-                                            eprintln!("   ❌ Failed to generate filter: {}", e);
+                                            error!("   ❌ Failed to generate filter: {}", e);
                                         }
                                     }
                                 }
                             }
                             Err(e) => {
-                                eprintln!("   ❌ Failed to generate ACK: {}", e);
+                                error!("   ❌ Failed to generate ACK: {}", e);
                             }
                         }
                     }
@@ -4764,13 +4685,12 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                             }
                         }
 
-                        eprintln!("   ⏳ Waiting for old listener to terminate...");
                         sleep(Duration::from_secs(2)).await;
 
                         watchdog.mark_disconnected().await;
 
                         // Attempt reconnection
-                        eprintln!("\n🔄 Attempting to reconnect to watch {}...", args.mac_address);
+                        debug!("\n🔄 Attempting to reconnect to watch {}...", args.mac_address);
 
                         let mut attempt = 0;
 
@@ -4784,8 +4704,6 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                             // Ensure Bluetooth is powered on
                             match adapter.is_powered().await {
                                 Ok(false) => {
-                                    eprintln!("   ⚠️  Bluetooth adapter is off, enabling...");
-                                    eprintln!("   🔧 Running: rfkill unblock bluetooth");
                                     if let Ok(output) = std::process::Command::new("rfkill")
                                         .args(&["unblock", "bluetooth"])
                                         .output()
@@ -4843,7 +4761,7 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                                 .await
                                 {
                                     Ok(connection) => {
-                                        eprintln!("   ✅ Successfully reconnected!");
+                                        info!("   ✅ Successfully reconnected!");
 
                                         drop(ble_arc);
                                         drop(communicator);
@@ -4857,7 +4775,7 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                                         Some(())
                                     }
                                     Err(_) => {
-                                        eprintln!("   ❌ Connection failed");
+                                        error!("   ❌ Connection failed");
                                         None
                                     }
                                 }

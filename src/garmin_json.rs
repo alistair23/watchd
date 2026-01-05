@@ -253,7 +253,7 @@ fn consolidate(
     strings: &HashMap<usize, String>,
 ) -> Result<()> {
     for obj in top_level.values_mut() {
-        println!("obj: {obj}");
+        debug!("obj: {obj}");
         match obj {
             Value::Object(obj) => {
                 if !obj.contains_key("fake0") {
@@ -262,8 +262,6 @@ fn consolidate(
 
                 let size = obj.len();
                 obj.clear();
-
-                println!("Found Objet: {size}");
 
                 for i in 0..size {
                     debug!("  Reading key-value pair #{}", i);
@@ -309,8 +307,6 @@ fn decode_value(data: &[u8], pos: &mut usize, strings: &HashMap<usize, String>) 
 
     let type_byte = data[*pos];
     *pos += 1;
-
-    println!("type_byte: {type_byte:?} / {pos}");
 
     match type_byte {
         TYPE_NULL => Ok(Value::Null),
