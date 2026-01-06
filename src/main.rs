@@ -4659,35 +4659,16 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                     last_watchdog_check = std::time::Instant::now();
 
                     if let Some(reason) = watchdog.check_reconnect_needed_sync(&ble_arc.device).await {
-                        eprintln!("   📡 Will attempt reconnection due to {reason}...");
+                        info!("   📡 Will attempt reconnection due to {reason}...");
 
                         // Mark watchdog as reconnecting
                         watchdog.start_reconnecting().await;
                         handler.set_connected(false);
 
                         // Cleanup old connection
-                        eprintln!("   ⏸️  Pausing and clearing MLR...");
                         communicator.clear_and_pause_mlr().await;
-
-                        eprintln!("   🧹 Shutting down old communication tasks...");
                         communicator.dispose().await;
-                        eprintln!("   ✅ Old tasks stopped");
-
-                        eprintln!("   🛑 Stopping old notification listener...");
                         ble_arc.stop_listener();
-
-                        eprintln!("   🔌 Disconnecting old connection...");
-                        if let Ok(true) = ble_arc.device.is_connected().await {
-                            if let Err(e) = ble_arc.device.disconnect().await {
-                                eprintln!("   ⚠️  Disconnect error: {}", e);
-                            } else {
-                                eprintln!("   ✅ Disconnected cleanly");
-                            }
-                        }
-
-                        sleep(Duration::from_secs(2)).await;
-
-                        watchdog.mark_disconnected().await;
 
                         // Attempt reconnection
                         debug!("\n🔄 Attempting to reconnect to watch {}...", args.mac_address);
@@ -4696,10 +4677,23 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
 
                         'reconnect: loop {
                             attempt += 1;
-                            eprintln!(
+                            info!(
                                 "   🔄 Reconnection attempt {}...",
                                 attempt,
                             );
+
+                            info!("   🔌 Disconnecting old connection...");
+                            if let Ok(true) = ble_arc.device.is_connected().await {
+                                if let Err(e) = ble_arc.device.disconnect().await {
+                                    error!("   ⚠️  Disconnect error: {}", e);
+                                } else {
+                                    debug!("   ✅ Disconnected cleanly");
+                                }
+                            }
+
+                            sleep(Duration::from_secs(2)).await;
+
+                            watchdog.mark_disconnected().await;
 
                             // Ensure Bluetooth is powered on
                             match adapter.is_powered().await {
