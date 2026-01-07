@@ -1652,7 +1652,7 @@ struct AsyncMessageHandler {
 }
 
 /// Maximum protobuf data size per PROTOBUF_RESPONSE chunk (tested on Garmin devices)
-const MAX_PROTOBUF_CHUNK_SIZE: usize = 1500;
+const MAX_PROTOBUF_CHUNK_SIZE: usize = 3700;
 
 impl AsyncMessageHandler {
     fn new() -> Self {
@@ -1977,6 +1977,17 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
                         info!("   Max Packet: {}", dev_info.max_packet_size);
                         info!("   Name: {}", dev_info.bluetooth_friendly_name);
                         info!("   Model: {}", dev_info.device_model);
+
+                        // Update communicator with device-reported max packet size
+                        let comm_ref = {
+                            let c = self.communicator.lock().unwrap();
+                            c.as_ref().cloned()
+                        };
+                        if let Some(communicator) = comm_ref {
+                            communicator
+                                .on_device_max_packet_size(dev_info.max_packet_size)
+                                .await;
+                        }
 
                         // Generate and send response immediately
                         match MessageGenerator::device_information_response(&dev_info) {

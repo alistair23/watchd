@@ -410,6 +410,36 @@ impl CommunicatorV2 {
         }
     }
 
+    /// Update the maximum packet size based on device-reported maximum
+    ///
+    /// The device reports its maximum supported packet size in the DeviceInformation message.
+    /// This method updates the max_write_size to be the minimum of the current MTU-based size
+    /// and the device-reported maximum, ensuring we respect the device's limitations.
+    pub async fn on_device_max_packet_size(&self, device_max_packet_size: u16) {
+        let mut state = self.state.lock().await;
+
+        let device_max = device_max_packet_size as usize;
+
+        // Use the minimum of current max_write_size and device-reported maximum
+        if device_max < state.max_write_size {
+            info!(
+                "Device max packet size ({}) is smaller than MTU-based size ({}), adjusting",
+                device_max, state.max_write_size
+            );
+            state.max_write_size = device_max;
+
+            // Update all MLR communicators with the new size
+            for mlr in state.mlr_communicators.values() {
+                mlr.set_max_packet_size(state.max_write_size).await;
+            }
+        } else {
+            info!(
+                "Device max packet size ({}) is >= MTU-based size ({}), keeping MTU-based size",
+                device_max, state.max_write_size
+            );
+        }
+    }
+
     /// Initialize the device - discovers characteristics and sets up ML protocol
     ///
     /// This is the Rust port of the Java `initializeDevice` method.
