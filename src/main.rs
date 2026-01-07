@@ -4682,12 +4682,14 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                                 attempt,
                             );
 
-                            info!("   🔌 Disconnecting old connection...");
-                            if let Ok(true) = ble_arc.device.is_connected().await {
-                                if let Err(e) = ble_arc.device.disconnect().await {
-                                    error!("   ⚠️  Disconnect error: {}", e);
-                                } else {
-                                    debug!("   ✅ Disconnected cleanly");
+                            if attempt > 0 && attempt % 20 == 0 {
+                                info!("   🔌 Disconnecting old connection...");
+                                if let Ok(true) = ble_arc.device.is_connected().await {
+                                    if let Err(e) = ble_arc.device.disconnect().await {
+                                        error!("   ⚠️  Disconnect error: {}", e);
+                                    } else {
+                                        debug!("   ✅ Disconnected cleanly");
+                                    }
                                 }
                             }
 
