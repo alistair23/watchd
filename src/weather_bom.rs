@@ -670,7 +670,7 @@ impl BomWeatherService {
                 // Log first few future forecasts
                 if hourly.len() < 6 {
                     log::debug!(
-                        "Future hourly forecast {}: time={}, timestamp={}, temp={}, icon={}",
+                        "Future hourly forecast {}: time={}, timestamp={}, temp={}, icon={}, uv={}",
                         hourly.len(),
                         time_str,
                         dt,
@@ -678,7 +678,12 @@ impl BomWeatherService {
                         forecast
                             .get("icon_descriptor")
                             .and_then(|i| i.as_str())
-                            .unwrap_or("unknown")
+                            .unwrap_or("unknown"),
+                        forecast
+                            .get("uv")
+                            .and_then(|u| u.as_f64())
+                            .map(|u| format!("{:.1}", u))
+                            .unwrap_or_else(|| "none".to_string())
                     );
                 }
 
@@ -743,9 +748,11 @@ impl BomWeatherService {
                     );
                 }
 
-                // UV index not available in BOM JSON API hourly forecasts
-                // Would need to fetch from separate XML product files
-                let uv_index = None;
+                // Extract UV index from hourly forecast
+                let uv_index = forecast
+                    .get("uv")
+                    .and_then(|u| u.as_f64())
+                    .map(|u| u as f32);
 
                 // Extract wind gust if available
                 let _wind_gust = forecast
