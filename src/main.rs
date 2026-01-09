@@ -11,6 +11,7 @@
 //! - `communicator`: High-level Garmin v2 communicator interface
 //! - `types`: Common types and enums used throughout the library
 
+pub mod air_quality_openaq;
 pub mod calendar;
 pub mod cobs;
 pub mod communicator;
@@ -1657,10 +1658,20 @@ const MAX_PROTOBUF_CHUNK_SIZE: usize = 3700;
 impl AsyncMessageHandler {
     fn new() -> Self {
         // Initialize BOM weather provider (no API key needed)
-        let weather_provider = Arc::new(UnifiedWeatherProvider::new(
+        let mut weather_provider = UnifiedWeatherProvider::new(
             WeatherProviderType::Bom,
             Some(600), // Cache for 10 minutes
-        ));
+        );
+
+        // Enable air quality if OpenAQ API key is provided
+        if let Ok(api_key) = std::env::var("OPENAQ_API_KEY") {
+            if !api_key.is_empty() {
+                log::info!("🌍 Enabling OpenAQ air quality support");
+                weather_provider.enable_air_quality(api_key, Some(600));
+            }
+        }
+
+        let weather_provider = Arc::new(weather_provider);
 
         let handler = Self {
             communicator: Arc::new(Mutex::new(None)),

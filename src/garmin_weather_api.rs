@@ -90,9 +90,9 @@ pub async fn handle_garmin_weather_request(
 
     debug!("   Coordinates: lat={}, lon={}", lat, lon);
 
-    // Fetch weather data synchronously using tokio runtime
+    // Fetch weather data with air quality enrichment
     let weather_data = weather_provider
-        .fetch_weather(lat, lon)
+        .fetch_weather_with_air_quality(lat, lon)
         .await
         .map_err(|e| format!("Failed to fetch weather: {}", e))?;
 
@@ -185,6 +185,7 @@ fn handle_current_weather(
             units: "INCHES_OF_MERCURY".to_string(),
         },
         cloud_coverage: weather.current.clouds,
+        air_quality: weather.current.air_quality,
     };
 
     serde_json::to_string(&current).map_err(|e| format!("JSON serialization error: {}", e))
@@ -265,7 +266,7 @@ fn handle_hourly_forecast(
             pressure: hourly
                 .pressure
                 .map(|p| convert_pressure(p as f64, "MILLIBAR")),
-            air_quality: hourly.air_quality.map(|aq| serde_json::json!(aq)),
+            air_quality: hourly.air_quality,
             cloud_cover: hourly.clouds,
         };
 
@@ -376,6 +377,8 @@ struct WeatherForecastCurrent {
     pressure: WeatherValue,
     pressure_change: WeatherValue,
     cloud_coverage: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    air_quality: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -418,7 +421,7 @@ struct WeatherForecastHour {
     #[serde(skip_serializing_if = "Option::is_none")]
     pressure: Option<WeatherValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    air_quality: Option<serde_json::Value>,
+    air_quality: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cloud_cover: Option<i32>,
 }

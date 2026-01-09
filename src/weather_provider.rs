@@ -4,9 +4,11 @@
 //! Supports:
 //! - OpenWeatherMap (global coverage, requires API key)
 //! - Australian Bureau of Meteorology (Australia only, no API key)
+//! - OpenAQ (global air quality data, requires API key)
 //!
 //! The provider can be selected at runtime based on location or configuration.
 
+use crate::air_quality_openaq::{AirQualityData, OpenAqError, OpenAqService};
 use crate::weather::semicircles_to_degrees;
 use crate::weather_bom::{BomWeatherError, BomWeatherService};
 use std::sync::Arc;
@@ -16,6 +18,9 @@ use thiserror::Error;
 pub enum WeatherProviderError {
     #[error("BOM error: {0}")]
     Bom(#[from] BomWeatherError),
+
+    #[error("OpenAQ error: {0}")]
+    OpenAq(#[from] OpenAqError),
 
     #[error("No suitable weather provider available")]
     NoProvider,
@@ -69,6 +74,7 @@ pub struct UnifiedCurrentWeather {
     pub wind_deg: i32,
     pub condition_code: i32,
     pub description: String,
+    pub air_quality: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +116,7 @@ pub struct UnifiedDailyWeather {
 pub struct UnifiedWeatherProvider {
     provider_type: WeatherProviderType,
     bom_service: Option<Arc<BomWeatherService>>,
+    openaq_service: Option<Arc<OpenAqService>>,
 }
 
 impl UnifiedWeatherProvider {
@@ -130,7 +137,80 @@ impl UnifiedWeatherProvider {
         Self {
             provider_type,
             bom_service,
+            openaq_service: None,
         }
+    }
+
+    /// Enable OpenAQ air quality service
+    ///
+    /// # Arguments
+    /// * `api_key` - OpenAQ API key (get from https://openaq.org)
+    /// * `cache_duration` - Cache duration in seconds
+    pub fn enable_air_quality(&mut self, api_key: String, cache_duration: Option<i64>) {
+        self.openaq_service = Some(Arc::new(OpenAqService::new(Some(api_key), cache_duration)));
+    }
+
+    /// Fetch air quality data for a location
+    ///
+    /// # Arguments
+    /// * `lat_semicircles` - Latitude in Garmin semicircles
+    /// * `lon_semicircles` - Longitude in Garmin semicircles
+    pub async fn fetch_air_quality(
+        &self,
+        lat_semicircles: i32,
+        lon_semicircles: i32,
+    ) -> Result<AirQualityData, WeatherProviderError> {
+        let lat = semicircles_to_degrees(lat_semicircles);
+        let lon = semicircles_to_degrees(lon_semicircles);
+
+        let service = self
+            .openaq_service
+            .as_ref()
+            .ok_or(WeatherProviderError::NotConfigured("OpenAQ".to_string()))?;
+
+        let data = service.fetch_air_quality(lat, lon, None).await?;
+        Ok(data)
+    }
+
+    /// Fetch weather data with air quality enrichment
+    ///
+    /// This method fetches weather data and attempts to enrich it with air quality
+    /// information if OpenAQ service is enabled.
+    ///
+    /// # Arguments
+    /// * `lat_semicircles` - Latitude in Garmin semicircles
+    /// * `lon_semicircles` - Longitude in Garmin semicircles
+    pub async fn fetch_weather_with_air_quality(
+        &self,
+        lat_semicircles: i32,
+        lon_semicircles: i32,
+    ) -> Result<UnifiedWeatherData, WeatherProviderError> {
+        // Fetch weather data
+        let mut weather_data = self.fetch_weather(lat_semicircles, lon_semicircles).await?;
+
+        // Try to fetch air quality and add AQI to current and hourly weather
+        if let Ok(air_quality) = self
+            .fetch_air_quality(lat_semicircles, lon_semicircles)
+            .await
+        {
+            // Add AQI to current weather
+            weather_data.current.air_quality = air_quality.garmin_aq;
+
+            // Add AQI to all hourly forecasts
+            for hourly in &mut weather_data.hourly {
+                hourly.air_quality = air_quality.garmin_aq;
+            }
+
+            log::info!(
+                "✅ Enriched weather data with Garmin AQ: {} from {}",
+                air_quality
+                    .garmin_aq
+                    .map_or("N/A".to_string(), |v| v.to_string()),
+                air_quality.location_name
+            );
+        }
+
+        Ok(weather_data)
     }
 
     /// Fetch weather data using the appropriate provider
@@ -215,6 +295,7 @@ impl UnifiedWeatherProvider {
                 wind_deg: bom.current.wind_deg,
                 condition_code: bom.current.condition_code,
                 description: bom.current.description,
+                air_quality: None,
             },
             hourly: bom
                 .hourly
@@ -268,6 +349,9 @@ impl UnifiedWeatherProvider {
         if let Some(ref service) = self.bom_service {
             service.clear_cache().await;
         }
+        if let Some(ref service) = self.openaq_service {
+            service.clear_cache().await;
+        }
     }
 
     /// Get cache statistics for all enabled providers
@@ -280,6 +364,14 @@ impl UnifiedWeatherProvider {
         }
 
         stats
+    }
+
+    /// Get air quality cache statistics
+    pub async fn air_quality_cache_stats(&self) -> Option<(usize, Vec<(String, i64)>)> {
+        if let Some(ref service) = self.openaq_service {
+            return Some(service.cache_stats().await);
+        }
+        None
     }
 }
 
