@@ -18,7 +18,7 @@
 //! BOM uses location IDs rather than lat/lon coordinates. This module includes
 //! major Australian cities and can be extended with additional locations.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -867,27 +867,21 @@ impl BomWeatherService {
         let mut daily = Vec::new();
 
         if let Some(forecasts) = data.get("data").and_then(|d| d.as_array()) {
-            let base_date = Utc::now().date_naive();
+            let base_date = Local::now().date_naive();
 
             for (index, forecast) in forecasts.iter().take(7).enumerate() {
                 // Get date - use index to calculate if parsing fails
                 let dt = if let Some(date_str) = forecast.get("date").and_then(|d| d.as_str()) {
                     log::debug!("Parsing BOM date: {}", date_str);
 
-                    if let Ok(parsed_date) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+                    if let Ok(parsed_date) =
+                        chrono::NaiveDateTime::parse_from_str(date_str, "%Y-%m-%dT%H:%M:%S%Z")
                     {
-                        if let Some(datetime) = parsed_date.and_hms_opt(12, 0, 0) {
-                            let timestamp = datetime.and_utc().timestamp();
-                            log::debug!("  Parsed to timestamp: {}", timestamp);
-                            timestamp
-                        } else {
-                            log::warn!("Failed to create time for date: {}", date_str);
-                            (base_date + chrono::Duration::days(index as i64))
-                                .and_hms_opt(12, 0, 0)
-                                .unwrap()
-                                .and_utc()
-                                .timestamp()
-                        }
+                        parsed_date
+                            .checked_add_signed(TimeDelta::hours(12))
+                            .unwrap()
+                            .and_utc()
+                            .timestamp()
                     } else {
                         log::warn!("Failed to parse date: {}, using index-based date", date_str);
                         (base_date + chrono::Duration::days(index as i64))
