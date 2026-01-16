@@ -4713,6 +4713,11 @@ async fn run_monitor(args: &Args) -> std::result::Result<(), Box<dyn std::error:
                                         debug!("   ✅ Disconnected cleanly");
                                     }
                                 }
+
+                                debug!("   ✅ Cleaning up old connection");
+                                communicator.clear_and_pause_mlr().await;
+                                communicator.dispose().await;
+                                ble_arc.stop_listener();
                             }
 
                             sleep(Duration::from_secs(2)).await;
