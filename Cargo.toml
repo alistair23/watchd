@@ -6,6 +6,27 @@ authors = ["Alistair Francis <alistair@alistair23.me>"]
 description = "Linux dameon to support Garmin watches and provide paired phone features"
 license = "AGPL-3.0"
 
+# ── Optional feature flags ────────────────────────────────────────────────────
+#
+#   akonadi   Enables the KDE Akonadi calendar provider, which reads events
+#             from the local KDE PIM store.
+#
+#             Prerequisites (install before building with this feature):
+#               • Qt 5.15 or Qt 6.x development files  (qmake must be on PATH
+#                 or pointed to via the QMAKE env-var)
+#               • KDE Frameworks 5 or 6 Akonadi core development package:
+#                   Fedora/RHEL  : dnf install akonadi-devel
+#                   Debian/Ubuntu: apt install libakonadi-dev
+#                   Arch Linux   : pacman -S akonadi
+#                   openSUSE     : zypper install akonadi-devel
+#
+#             Build command:
+#               cargo build --features akonadi
+#
+[features]
+default = []
+akonadi = ["dep:cxx", "dep:cxx-qt-build"]
+
 [dependencies]
 log = "0.4"
 thiserror = "1.0"
@@ -18,6 +39,7 @@ uuid = "1.0"
 futures = "0.3"
 async-trait = "0.1"
 chrono = "0.4"
+chrono-tz = "0.8"
 axum = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
@@ -25,6 +47,17 @@ zbus = { version = "4.0", default-features = false, features = ["tokio"] }
 reqwest = { version = "0.11", features = ["json", "blocking"] }
 flate2 = "1.0"
 env_logger = "0.11"
+
+# CXX bridge runtime support — provides the generated glue types (rust::Vec,
+# rust::String, etc.) that the Akonadi C++ bridge uses.  Only compiled when
+# the `akonadi` feature is active.
+cxx = { version = "1.0", optional = true }
+
+[build-dependencies]
+# cxx-qt-build: discovers Qt via qmake, runs the CXX / CXX-Qt code generators,
+# and compiles the resulting C++ into the binary.  Optional so that systems
+# without Qt installed can still build watchd without the Akonadi feature.
+cxx-qt-build = { version = "0.7", optional = true }
 
 [[bin]]
 name = "watchd"

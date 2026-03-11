@@ -4,6 +4,7 @@
 //! applications and format them for synchronization with Garmin watches.
 
 use chrono::{Datelike, Local, TimeZone, Timelike, Utc};
+use chrono_tz::Tz;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -142,7 +143,7 @@ impl UrlCalendarProvider {
     }
 
     /// Parse iCalendar file containing multiple VEVENT components
-    fn parse_ical_file(
+    pub(crate) fn parse_ical_file(
         ical_data: &str,
         calendar_name: String,
         color: i32,
@@ -209,10 +210,22 @@ impl UrlCalendarProvider {
                 }
                 in_event = false;
             } else if in_event && !line_trimmed.is_empty() {
-                if let Some((key, value)) = line_trimmed.split_once(':') {
+                if let Some((key_part, value)) = line_trimmed.split_once(':') {
                     // Handle property parameters (e.g., DTSTART;TZID=America/New_York:20240101T120000)
-                    let key_parts: Vec<&str> = key.split(';').collect();
+                    let key_parts: Vec<&str> = key_part.split(';').collect();
                     let prop_name = key_parts[0].to_string();
+
+                    // Extract TZID parameter and store it as a companion key so
+                    // parse_ical_datetime can convert the time correctly.
+                    // e.g. "DTSTART;TZID=America/New_York" → inserts "DTSTART_TZID" = "America/New_York"
+                    for param in &key_parts[1..] {
+                        if let Some(tz) = param.strip_prefix("TZID=") {
+                            current_event.insert(
+                                format!("{}_TZID", prop_name),
+                                tz.to_string(),
+                            );
+                        }
+                    }
 
                     // Check if this might be a multiline value
                     multiline_key = Some(prop_name.clone());
@@ -240,7 +253,7 @@ impl UrlCalendarProvider {
     }
 
     /// Expand a recurring event into individual instances within a time range
-    fn expand_recurring_event(
+    pub(crate) fn expand_recurring_event(
         event: &CalendarEvent,
         start_range: i64,
         end_range: i64,
@@ -269,7 +282,7 @@ impl UrlCalendarProvider {
             } else if part.starts_with("COUNT=") {
                 count = part[6..].parse::<usize>().ok();
             } else if part.starts_with("UNTIL=") {
-                until = Self::parse_ical_datetime(&part[6..]);
+                until = Self::parse_ical_datetime(&part[6..], None);
             } else if part.starts_with("INTERVAL=") {
                 interval = part[9..].parse::<i64>().unwrap_or(1);
             }
@@ -405,11 +418,13 @@ impl UrlCalendarProvider {
 
         // Parse start time
         let start_str = props.get("DTSTART")?;
-        let start_timestamp = Self::parse_ical_datetime(start_str)?;
+        let start_tzid = props.get("DTSTART_TZID").map(String::as_str);
+        let start_timestamp = Self::parse_ical_datetime(start_str, start_tzid)?;
 
         // Parse end time (or use DURATION)
         let end_timestamp = if let Some(end_str) = props.get("DTEND") {
-            Self::parse_ical_datetime(end_str)?
+            let end_tzid = props.get("DTEND_TZID").map(String::as_str);
+            Self::parse_ical_datetime(end_str, end_tzid)?
         } else if let Some(duration_str) = props.get("DURATION") {
             start_timestamp + Self::parse_ical_duration(duration_str)?
         } else {
@@ -436,12 +451,18 @@ impl UrlCalendarProvider {
         })
     }
 
-    /// Parse iCalendar date-time string to Unix timestamp
-    fn parse_ical_datetime(dt_str: &str) -> Option<i64> {
+    /// Parse iCalendar date-time string to Unix timestamp.
+    ///
+    /// `tzid` is the IANA timezone name extracted from the `TZID=` property
+    /// parameter (e.g. `"America/New_York"`).  When present it is used to
+    /// convert the local wall-clock time to a UTC Unix timestamp.  When
+    /// absent, floating times are interpreted in the system local timezone.
+    fn parse_ical_datetime(dt_str: &str, tzid: Option<&str>) -> Option<i64> {
         // Handle different formats:
         // - YYYYMMDD (date only, all-day event)
-        // - YYYYMMDDTHHMMSS (local time)
+        // - YYYYMMDDTHHMMSS (floating / local time)
         // - YYYYMMDDTHHMMSSZ (UTC time)
+        // - YYYYMMDDTHHMMSS with TZID parameter (named timezone)
         // - VALUE=DATE:YYYYMMDD (with parameter)
 
         // Strip VALUE=DATE: prefix if present
@@ -487,7 +508,9 @@ impl UrlCalendarProvider {
                 }
             };
 
-            match Utc.with_ymd_and_hms(year, month, day, 0, 0, 0).single() {
+            // All-day events have no timezone; interpret as local midnight so
+            // the date is correct regardless of the user's UTC offset.
+            match Local.with_ymd_and_hms(year, month, day, 0, 0, 0).single() {
                 Some(dt) => {
                     return Some(dt.timestamp());
                 }
@@ -561,9 +584,9 @@ impl UrlCalendarProvider {
                 }
             };
 
-            // Check if this is UTC (ends with Z) or local time
+            // Check if this is UTC (ends with Z), TZID-qualified, or floating.
             let timestamp = if clean_str.ends_with('Z') {
-                // UTC time - parse as UTC
+                // Explicit UTC timestamp.
                 match Utc
                     .with_ymd_and_hms(year, month, day, hour, minute, second)
                     .single()
@@ -577,16 +600,58 @@ impl UrlCalendarProvider {
                         return None;
                     }
                 }
+            } else if let Some(tz_name) = tzid {
+                // Named timezone from the TZID= property parameter.
+                match tz_name.parse::<Tz>() {
+                    Ok(tz) => {
+                        // .single() returns None for ambiguous wall-clock times
+                        // (DST "fall-back" hour); use .earliest() as a safe fallback.
+                        let mapped = tz
+                            .with_ymd_and_hms(year, month, day, hour, minute, second)
+                            .single()
+                            .or_else(|| {
+                                tz.with_ymd_and_hms(year, month, day, hour, minute, second)
+                                    .earliest()
+                            });
+                        match mapped {
+                            Some(dt) => dt.timestamp(),
+                            None => {
+                                warn!(
+                                    "ICS Parser: Could not map {}-{:02}-{:02} {:02}:{:02}:{:02} \
+                                     in timezone '{}'; falling back to local",
+                                    year, month, day, hour, minute, second, tz_name
+                                );
+                                match Local
+                                    .with_ymd_and_hms(year, month, day, hour, minute, second)
+                                    .single()
+                                {
+                                    Some(dt) => dt.timestamp(),
+                                    None => return None,
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        warn!(
+                            "ICS Parser: Unknown TZID '{}', falling back to local time",
+                            tz_name
+                        );
+                        match Local
+                            .with_ymd_and_hms(year, month, day, hour, minute, second)
+                            .single()
+                        {
+                            Some(dt) => dt.timestamp(),
+                            None => return None,
+                        }
+                    }
+                }
             } else {
-                // Local time - parse as local timezone then convert to UTC timestamp
+                // Floating time — no timezone specified; treat as system local.
                 match Local
                     .with_ymd_and_hms(year, month, day, hour, minute, second)
                     .single()
                 {
-                    Some(dt) => {
-                        let utc_timestamp = dt.timestamp();
-                        utc_timestamp
-                    }
+                    Some(dt) => dt.timestamp(),
                     None => {
                         warn!(
                             "ICS Parser: Invalid local datetime {}-{:02}-{:02} {:02}:{:02}:{:02}",
@@ -836,6 +901,24 @@ impl CalendarManager {
             }
         }
 
+        // Try the Akonadi calendar provider (KDE PIM store).
+        // Compiled only when the `akonadi` Cargo feature is active; on
+        // non-KDE systems this block is entirely absent from the binary.
+        #[cfg(feature = "akonadi")]
+        {
+            use crate::akonadi_calendar_provider::AkonadiCalendarProvider;
+            let akonadi = AkonadiCalendarProvider::new();
+            if akonadi.is_available().await {
+                info!("Akonadi calendar provider is available — adding to manager.");
+                providers.push(Box::new(akonadi));
+            } else {
+                info!(
+                    "Akonadi calendar provider is not available \
+                     (Akonadi server not running or KDE not installed); skipping."
+                );
+            }
+        }
+
         if providers.is_empty() {
             return Err(CalendarError::NoProvidersAvailable);
         }
@@ -912,10 +995,11 @@ mod tests {
 
     #[test]
     fn test_parse_ical_datetime_date_only() {
-        let result = UrlCalendarProvider::parse_ical_datetime("20240315");
+        // All-day events are interpreted as local midnight, so check the local date.
+        let result = UrlCalendarProvider::parse_ical_datetime("20240315", None);
         assert!(result.is_some());
         let timestamp = result.unwrap();
-        let dt = Utc.timestamp_opt(timestamp, 0).unwrap();
+        let dt = Local.timestamp_opt(timestamp, 0).unwrap();
         assert_eq!(dt.year(), 2024);
         assert_eq!(dt.month(), 3);
         assert_eq!(dt.day(), 15);
@@ -923,7 +1007,7 @@ mod tests {
 
     #[test]
     fn test_parse_ical_datetime_with_time() {
-        let result = UrlCalendarProvider::parse_ical_datetime("20240315T143000Z");
+        let result = UrlCalendarProvider::parse_ical_datetime("20240315T143000Z", None);
         assert!(result.is_some());
         let timestamp = result.unwrap();
         let dt = Utc.timestamp_opt(timestamp, 0).unwrap();
@@ -931,6 +1015,24 @@ mod tests {
         assert_eq!(dt.month(), 3);
         assert_eq!(dt.day(), 15);
         assert_eq!(dt.hour(), 14);
+        assert_eq!(dt.minute(), 30);
+        assert_eq!(dt.second(), 0);
+    }
+
+    #[test]
+    fn test_parse_ical_datetime_with_tzid() {
+        // 2024-03-15 14:30:00 America/New_York = 2024-03-15 18:30:00 UTC (EDT = UTC-4)
+        let result = UrlCalendarProvider::parse_ical_datetime(
+            "20240315T143000",
+            Some("America/New_York"),
+        );
+        assert!(result.is_some());
+        let timestamp = result.unwrap();
+        let dt = Utc.timestamp_opt(timestamp, 0).unwrap();
+        assert_eq!(dt.year(), 2024);
+        assert_eq!(dt.month(), 3);
+        assert_eq!(dt.day(), 15);
+        assert_eq!(dt.hour(), 18);
         assert_eq!(dt.minute(), 30);
         assert_eq!(dt.second(), 0);
     }
