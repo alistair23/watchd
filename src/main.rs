@@ -680,13 +680,7 @@ impl GarminNotificationHandler {
                 Err(e) => {
                     let err_msg = format!("{}", e);
                     if err_msg.contains("Not connected") || err_msg.contains("not connected") {
-                        debug!("❌ BLE connection lost - triggering immediate watchdog restart");
-                        // Mark as disconnected so watchdog triggers immediately
-                        let watchdog = self.watchdog.clone();
-                        tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current()
-                                .block_on(watchdog.mark_disconnected());
-                        });
+                        error!("❌ BLE connection lost");
                     }
                     return Err(e);
                 }
@@ -731,10 +725,6 @@ impl GarminNotificationHandler {
 
                     // Mark handler and watchdog as disconnected
                     self.set_connected(false);
-                    let watchdog = self.watchdog.clone();
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(watchdog.mark_disconnected());
-                    });
 
                     // Queue this notification for replay after reconnection
                     info!(
@@ -1119,15 +1109,7 @@ impl GarminNotificationHandler {
                     Err(e) => {
                         let err_msg = format!("{}", e);
                         if err_msg.contains("Not connected") || err_msg.contains("not connected") {
-                            eprintln!(
-                                "❌ BLE connection lost - triggering immediate watchdog restart"
-                            );
-                            // Mark as disconnected so watchdog triggers immediately
-                            let watchdog = self.watchdog.clone();
-                            tokio::task::block_in_place(|| {
-                                tokio::runtime::Handle::current()
-                                    .block_on(watchdog.mark_disconnected());
-                            });
+                            error!("❌ BLE connection lost");
                         }
                         return Err(e);
                     }
@@ -1186,12 +1168,7 @@ impl GarminNotificationHandler {
             Err(e) => {
                 let err_msg = format!("{}", e);
                 if err_msg.contains("Not connected") || err_msg.contains("not connected") {
-                    eprintln!("❌ BLE connection lost - triggering immediate watchdog restart");
-                    // Mark as disconnected so watchdog triggers immediately
-                    let watchdog = self.watchdog.clone();
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(watchdog.mark_disconnected());
-                    });
+                    eprintln!("❌ BLE connection lost");
                 }
                 return Err(e);
             }
@@ -1262,15 +1239,7 @@ impl GarminNotificationHandler {
                     Err(e) => {
                         let err_msg = format!("{}", e);
                         if err_msg.contains("Not connected") || err_msg.contains("not connected") {
-                            eprintln!(
-                                "❌ BLE connection lost - triggering immediate watchdog restart"
-                            );
-                            // Mark as disconnected so watchdog triggers immediately
-                            let watchdog = self.watchdog.clone();
-                            tokio::task::block_in_place(|| {
-                                tokio::runtime::Handle::current()
-                                    .block_on(watchdog.mark_disconnected());
-                            });
+                            eprintln!("❌ BLE connection lost");
                         }
                         return Err(e);
                     }
