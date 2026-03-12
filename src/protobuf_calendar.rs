@@ -472,11 +472,19 @@ pub async fn handle_calendar_request(
         }
     };
 
+    // Extend the end timestamp to 23:59:59 of the last day so that every
+    // event *starting* on the final day of the requested range is included.
+    // The watch typically sends midnight (00:00:00) as the end boundary, which
+    // would otherwise exclude events that begin later that same day.
+    const SECONDS_PER_DAY: u64 = 86_400;
+    let end_of_last_day =
+        ((request.end_date / SECONDS_PER_DAY) + 1) * SECONDS_PER_DAY - 1;
+
     // Fetch events from calendar manager
     let events = manager
         .fetch_events(
             request.start_date as i64,
-            request.end_date as i64,
+            end_of_last_day as i64,
             request.max_events as usize,
             request.include_all_day,
         )
