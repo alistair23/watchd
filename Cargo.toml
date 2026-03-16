@@ -1,6 +1,6 @@
 [package]
 name = "watchd"
-version = "0.1.0"
+version = "0.1.3"
 edition = "2021"
 authors = ["Alistair Francis <alistair@alistair23.me>"]
 description = "Linux dameon to support Garmin watches and provide paired phone features"
