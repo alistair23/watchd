@@ -30,10 +30,12 @@
 
 use std::sync::OnceLock;
 use std::thread;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use log::{debug, error, info, warn};
 use tokio::sync::oneshot;
+use tokio::time::{sleep, Instant};
 
 use crate::akonadi::ffi;
 use crate::calendar::{CalendarError, CalendarEvent, CalendarProvider, UrlCalendarProvider};
@@ -147,6 +149,49 @@ impl AkonadiHandle {
             .expect("failed to spawn watchd-qt-akonadi thread");
 
         Self { tx }
+    }
+
+    /// Poll the Qt thread until the Akonadi server becomes available, or until
+    /// `timeout` elapses.
+    ///
+    /// Returns `true` if the server became available within the timeout,
+    /// `false` otherwise.  Logs a one-time `info!` on the first failed probe,
+    /// each subsequent retry at `debug!` level, and a final message when the
+    /// server either becomes ready or the deadline expires.
+    async fn wait_for_server(&self, timeout: Duration, poll_interval: Duration) -> bool {
+        // Fast path — server is already up.
+        if self.is_available().await {
+            return true;
+        }
+
+        let deadline = Instant::now() + timeout;
+        info!(
+            "[akonadi] Server not yet available — waiting up to {}s for it to start…",
+            timeout.as_secs()
+        );
+
+        loop {
+            sleep(poll_interval).await;
+
+            if self.is_available().await {
+                info!("[akonadi] Server is now available.");
+                return true;
+            }
+
+            if Instant::now() >= deadline {
+                warn!(
+                    "[akonadi] Timed out after {}s waiting for the Akonadi server.",
+                    timeout.as_secs()
+                );
+                return false;
+            }
+
+            debug!(
+                "[akonadi] Still waiting for Akonadi server \
+                 ({:.0}s remaining)…",
+                deadline.saturating_duration_since(Instant::now()).as_secs_f32()
+            );
+        }
     }
 
     /// Ask the Qt thread whether Akonadi is currently available.
@@ -338,10 +383,15 @@ impl CalendarProvider for AkonadiCalendarProvider {
             start, end, max_events, include_all_day
         );
 
-        // Check availability before attempting a (potentially slow) fetch.
-        if !self.handle.is_available().await {
+        // Wait for the Akonadi server to become available before fetching.
+        // On a freshly-started desktop session the server may take a few
+        // seconds to initialise, so we poll for up to 2 minutes rather than
+        // failing immediately.
+        const WAIT_TIMEOUT: Duration = Duration::from_secs(120);
+        const POLL_INTERVAL: Duration = Duration::from_secs(5);
+        if !self.handle.wait_for_server(WAIT_TIMEOUT, POLL_INTERVAL).await {
             return Err(CalendarError::ProviderNotAvailable(
-                "Akonadi server is not running".to_string(),
+                "Akonadi server did not start within the timeout".to_string(),
             ));
         }
 

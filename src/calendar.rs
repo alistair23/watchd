@@ -904,19 +904,20 @@ impl CalendarManager {
         // Try the Akonadi calendar provider (KDE PIM store).
         // Compiled only when the `akonadi` Cargo feature is active; on
         // non-KDE systems this block is entirely absent from the binary.
+        //
+        // We register the provider unconditionally rather than gating on
+        // `is_available()`: at startup the Akonadi server may not have
+        // finished launching yet.  The provider's `fetch_events` will wait
+        // for the server to become available before making the first real
+        // request, so there is no benefit in probing here.
         #[cfg(feature = "akonadi")]
         {
             use crate::akonadi_calendar_provider::AkonadiCalendarProvider;
             let akonadi = AkonadiCalendarProvider::new();
-            if akonadi.is_available().await {
-                info!("Akonadi calendar provider is available — adding to manager.");
-                providers.push(Box::new(akonadi));
-            } else {
-                info!(
-                    "Akonadi calendar provider is not available \
-                     (Akonadi server not running or KDE not installed); skipping."
-                );
-            }
+            info!(
+                "Akonadi calendar provider registered — will wait for server on first use."
+            );
+            providers.push(Box::new(akonadi));
         }
 
         if providers.is_empty() {
