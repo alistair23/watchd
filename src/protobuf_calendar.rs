@@ -477,8 +477,7 @@ pub async fn handle_calendar_request(
     // The watch typically sends midnight (00:00:00) as the end boundary, which
     // would otherwise exclude events that begin later that same day.
     const SECONDS_PER_DAY: u64 = 86_400;
-    let end_of_last_day =
-        ((request.end_date / SECONDS_PER_DAY) + 1) * SECONDS_PER_DAY - 1;
+    let end_of_last_day = ((request.end_date / SECONDS_PER_DAY) + 1) * SECONDS_PER_DAY - 1;
 
     // Fetch events from calendar manager
     let events = manager

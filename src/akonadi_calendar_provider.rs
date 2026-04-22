@@ -47,9 +47,7 @@ use crate::calendar::{CalendarError, CalendarEvent, CalendarProvider, UrlCalenda
 /// A single request sent to the dedicated Qt OS thread.
 enum QtRequest {
     /// Check whether the Akonadi server is reachable.
-    IsAvailable {
-        reply: oneshot::Sender<bool>,
-    },
+    IsAvailable { reply: oneshot::Sender<bool> },
     /// Fetch all calendar ICS payloads from Akonadi.
     FetchIcs {
         start_ts: i64,
@@ -189,7 +187,9 @@ impl AkonadiHandle {
             debug!(
                 "[akonadi] Still waiting for Akonadi server \
                  ({:.0}s remaining)…",
-                deadline.saturating_duration_since(Instant::now()).as_secs_f32()
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_secs_f32()
             );
         }
     }
@@ -220,11 +220,7 @@ impl AkonadiHandle {
     }
 
     /// Ask the Qt thread to fetch all calendar ICS payloads from Akonadi.
-    async fn fetch_ics(
-        &self,
-        start_ts: i64,
-        end_ts: i64,
-    ) -> Result<Vec<String>, CalendarError> {
+    async fn fetch_ics(&self, start_ts: i64, end_ts: i64) -> Result<Vec<String>, CalendarError> {
         let (reply_tx, reply_rx) = oneshot::channel();
 
         self.tx
@@ -319,11 +315,7 @@ impl AkonadiCalendarProvider {
                     }
                 }
                 Err(e) => {
-                    warn!(
-                        "[akonadi] Failed to parse ICS payload #{}: {}",
-                        idx + 1,
-                        e
-                    );
+                    warn!("[akonadi] Failed to parse ICS payload #{}: {}", idx + 1, e);
                 }
             }
         }
@@ -389,7 +381,11 @@ impl CalendarProvider for AkonadiCalendarProvider {
         // failing immediately.
         const WAIT_TIMEOUT: Duration = Duration::from_secs(120);
         const POLL_INTERVAL: Duration = Duration::from_secs(5);
-        if !self.handle.wait_for_server(WAIT_TIMEOUT, POLL_INTERVAL).await {
+        if !self
+            .handle
+            .wait_for_server(WAIT_TIMEOUT, POLL_INTERVAL)
+            .await
+        {
             return Err(CalendarError::ProviderNotAvailable(
                 "Akonadi server did not start within the timeout".to_string(),
             ));
@@ -402,10 +398,12 @@ impl CalendarProvider for AkonadiCalendarProvider {
             ics_payloads.len()
         );
 
-        let events =
-            Self::parse_and_filter(ics_payloads, start, end, max_events, include_all_day);
+        let events = Self::parse_and_filter(ics_payloads, start, end, max_events, include_all_day);
 
-        info!("[akonadi] Returning {} parsed CalendarEvent(s).", events.len());
+        info!(
+            "[akonadi] Returning {} parsed CalendarEvent(s).",
+            events.len()
+        );
 
         Ok(events)
     }
@@ -423,13 +421,7 @@ mod tests {
     /// input and applies the max_events cap.
     #[test]
     fn test_parse_and_filter_empty() {
-        let events = AkonadiCalendarProvider::parse_and_filter(
-            vec![],
-            0,
-            i64::MAX,
-            0,
-            true,
-        );
+        let events = AkonadiCalendarProvider::parse_and_filter(vec![], 0, i64::MAX, 0, true);
         assert!(events.is_empty());
     }
 
@@ -451,13 +443,8 @@ END:VCALENDAR\r\n"
 
         // Window is now → now+1d; the past event should be filtered out.
         let now = chrono::Utc::now().timestamp();
-        let events = AkonadiCalendarProvider::parse_and_filter(
-            vec![past_ics],
-            now,
-            now + 86400,
-            0,
-            true,
-        );
+        let events =
+            AkonadiCalendarProvider::parse_and_filter(vec![past_ics], now, now + 86400, 0, true);
         assert!(
             events.is_empty(),
             "Expected past event to be filtered out, got: {:?}",

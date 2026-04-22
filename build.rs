@@ -83,7 +83,9 @@ fn build_akonadi() {
     // SAFETY: build scripts are single-threaded; no other thread reads QMAKE
     // concurrently.
     let qmake = find_qmake();
-    unsafe { std::env::set_var("QMAKE", &qmake); }
+    unsafe {
+        std::env::set_var("QMAKE", &qmake);
+    }
 
     let akonadi = find_akonadi();
 
@@ -145,10 +147,7 @@ fn build_akonadi() {
     // (CxxQtBuilder already emits the Qt Core link directives.)
     // ------------------------------------------------------------------
     for path in &link_paths {
-        println!(
-            "cargo:rustc-link-search=native={}",
-            path.display()
-        );
+        println!("cargo:rustc-link-search=native={}", path.display());
     }
     for lib in &libs {
         println!("cargo:rustc-link-lib={}", lib);
@@ -164,8 +163,8 @@ fn build_akonadi() {
 #[derive(Default)]
 struct AkonadiInfo {
     include_paths: Vec<std::path::PathBuf>,
-    link_paths:    Vec<std::path::PathBuf>,
-    libs:          Vec<String>,
+    link_paths: Vec<std::path::PathBuf>,
+    libs: Vec<String>,
 }
 
 /// Locate Akonadi headers and the library name.
@@ -195,8 +194,8 @@ fn find_akonadi() -> AkonadiInfo {
         );
         return AkonadiInfo {
             include_paths: vec![std::path::PathBuf::from(inc)],
-            link_paths:    vec![],
-            libs:          vec![lib],
+            link_paths: vec![],
+            libs: vec![lib],
         };
     }
 
@@ -215,10 +214,7 @@ fn find_akonadi() -> AkonadiInfo {
         .cloned()
         .unwrap_or_default();
 
-    let qt_libs = qt_vars
-        .get("QT_INSTALL_LIBS")
-        .cloned()
-        .unwrap_or_default();
+    let qt_libs = qt_vars.get("QT_INSTALL_LIBS").cloned().unwrap_or_default();
 
     // QT_INSTALL_ARCHDATA is where the mkspecs tree lives, e.g.
     // /usr/lib/qt5  or  /usr/lib64/qt5
@@ -249,8 +245,13 @@ fn find_akonadi() -> AkonadiInfo {
     //          module it transitively depends on.
     // ------------------------------------------------------------------
     let mut visited = std::collections::HashSet::new();
-    let (core_libs, mut include_paths) =
-        collect_module_includes("AkonadiCore", &mkspecs_dir, &qt_headers, &qt_libs, &mut visited);
+    let (core_libs, mut include_paths) = collect_module_includes(
+        "AkonadiCore",
+        &mkspecs_dir,
+        &qt_headers,
+        &qt_libs,
+        &mut visited,
+    );
 
     if include_paths.is_empty() {
         // .pri-based detection yielded nothing.
@@ -383,12 +384,12 @@ fn find_akonadi() -> AkonadiInfo {
 fn try_pkg_config(qt_libs: &str) -> Option<AkonadiInfo> {
     // ── Step 1: find which pkg-config name the distro uses for AkonadiCore ──
     let core_candidates = [
-        "KPim6AkonadiCore",   // Fedora, openSUSE, Arch (Qt6)
-        "KPim5AkonadiCore",   // Fedora, openSUSE, Arch (Qt5)
-        "KF6AkonadiCore",     // older KDE Frameworks packaging (Qt6)
-        "KF5AkonadiCore",     // older KDE Frameworks packaging (Qt5)
-        "akonadi-core",       // some Alpine / Debian variants
-        "akonadi",            // last-resort generic name
+        "KPim6AkonadiCore", // Fedora, openSUSE, Arch (Qt6)
+        "KPim5AkonadiCore", // Fedora, openSUSE, Arch (Qt5)
+        "KF6AkonadiCore",   // older KDE Frameworks packaging (Qt6)
+        "KF5AkonadiCore",   // older KDE Frameworks packaging (Qt5)
+        "akonadi-core",     // some Alpine / Debian variants
+        "akonadi",          // last-resort generic name
     ];
 
     let core_name = core_candidates.iter().find(|&&name| {
@@ -411,13 +412,13 @@ fn try_pkg_config(qt_libs: &str) -> Option<AkonadiInfo> {
         "KPim6AkonadiWidgets",
         "KPim6AkonadiXml",
         "KPim6AkonadiMime",
-        "KF6CoreAddons",     // provides KJob::exec() (Qt6)
+        "KF6CoreAddons", // provides KJob::exec() (Qt6)
         "KPim5AkonadiCalendar",
         "KPim5AkonadiAgentBase",
         "KPim5AkonadiWidgets",
         "KPim5AkonadiXml",
         "KPim5AkonadiMime",
-        "KF5CoreAddons",     // provides KJob::exec() (Qt5)
+        "KF5CoreAddons", // provides KJob::exec() (Qt5)
     ];
 
     let mut all_modules: Vec<&str> = vec![core_name];
@@ -535,7 +536,7 @@ fn try_direct_probe(qt_libs: &str) -> Option<AkonadiInfo> {
     // /usr/include/KPim5/AkonadiCore) so that both `#include <Akonadi/Foo>`
     // and `#include <AkonadiCore/Foo>` style includes resolve.
     let include_roots = ["/usr/include", "/usr/local/include"];
-    let kde_prefixes  = ["KPim6", "KF6", "KPim5", "KF5"];
+    let kde_prefixes = ["KPim6", "KF6", "KPim5", "KF5"];
 
     let mut include_paths: Vec<std::path::PathBuf> = Vec::new();
 
@@ -598,15 +599,16 @@ fn try_direct_probe(qt_libs: &str) -> Option<AkonadiInfo> {
 
     let lib_candidates = build_lib_candidates(qt_libs);
 
-    let mut lib_names:  Vec<String>              = Vec::new();
-    let mut link_paths: Vec<std::path::PathBuf>  = Vec::new();
+    let mut lib_names: Vec<String> = Vec::new();
+    let mut link_paths: Vec<std::path::PathBuf> = Vec::new();
 
     for lib in &known_libs {
         let so = format!("lib{}.so", lib);
         if let Some(dir) = lib_candidates.iter().find(|d| d.join(&so).exists()) {
             println!(
                 "cargo:warning=watchd[akonadi]: direct probe: found {} in {}",
-                so, dir.display()
+                so,
+                dir.display()
             );
             lib_names.push(lib.to_string());
             if !link_paths.contains(dir) {
@@ -650,7 +652,7 @@ fn try_direct_probe(qt_libs: &str) -> Option<AkonadiInfo> {
 /// cause the versioned Qt file to be found before the unversioned KDE symlink.
 #[cfg(feature = "akonadi")]
 fn probe_lib_dir(lib_name: &str, qt_libs: &str) -> std::path::PathBuf {
-    let so_name      = format!("lib{}.so",  lib_name);
+    let so_name = format!("lib{}.so", lib_name);
     let so_versioned = format!("lib{}.so.", lib_name); // prefix for e.g. .so.5
 
     let candidates = build_lib_candidates(qt_libs);
@@ -660,7 +662,8 @@ fn probe_lib_dir(lib_name: &str, qt_libs: &str) -> std::path::PathBuf {
         if dir.join(&so_name).exists() {
             println!(
                 "cargo:warning=watchd[akonadi]: found {} in {}",
-                so_name, dir.display()
+                so_name,
+                dir.display()
             );
             return dir.clone();
         }
@@ -677,7 +680,8 @@ fn probe_lib_dir(lib_name: &str, qt_libs: &str) -> std::path::PathBuf {
                 println!(
                     "cargo:warning=watchd[akonadi]: found versioned {} in {} \
                      (no unversioned symlink — is the -devel package installed?)",
-                    so_name, dir.display()
+                    so_name,
+                    dir.display()
                 );
                 return dir.clone();
             }
@@ -752,13 +756,7 @@ fn find_mkspecs_dir(qt_archdata: &str, qt_libs: &str) -> std::path::PathBuf {
     for path in candidates {
         // The directory must exist AND contain at least one .pri file to be
         // considered a valid mkspecs/modules directory.
-        if path.exists()
-            && path
-                .read_dir()
-                .ok()
-                .and_then(|mut d| d.next())
-                .is_some()
-        {
+        if path.exists() && path.read_dir().ok().and_then(|mut d| d.next()).is_some() {
             println!(
                 "cargo:warning=watchd[akonadi]: mkspecs/modules dir: {}",
                 path.display()
@@ -812,11 +810,11 @@ fn find_mkspecs_dir(qt_archdata: &str, qt_libs: &str) -> std::path::PathBuf {
 /// whichever paths actually exist on disk.
 #[cfg(feature = "akonadi")]
 fn collect_module_includes(
-    module:      &str,
+    module: &str,
     mkspecs_dir: &std::path::Path,
-    qt_headers:  &str,
-    qt_libs:     &str,
-    visited:     &mut std::collections::HashSet<String>,
+    qt_headers: &str,
+    qt_libs: &str,
+    visited: &mut std::collections::HashSet<String>,
 ) -> (Vec<String>, Vec<std::path::PathBuf>) {
     if !visited.insert(module.to_string()) {
         return (vec![], vec![]);
@@ -833,36 +831,45 @@ fn collect_module_includes(
     }
 
     let content = match std::fs::read_to_string(&pri_path) {
-        Ok(c)  => c,
+        Ok(c) => c,
         Err(e) => {
             println!(
                 "cargo:warning=watchd[akonadi]: could not read {}: {}",
-                pri_path.display(), e
+                pri_path.display(),
+                e
             );
             return (vec![], vec![]);
         }
     };
 
-    let key_module   = format!("QT.{}.module",   module);
+    let key_module = format!("QT.{}.module", module);
     let key_includes = format!("QT.{}.includes", module);
-    let key_depends  = format!("QT.{}.depends",  module);
+    let key_depends = format!("QT.{}.depends", module);
 
-    let mut library_name  = String::new();
-    let mut raw_includes  = Vec::<String>::new();
-    let mut dep_modules   = Vec::<String>::new();
+    let mut library_name = String::new();
+    let mut raw_includes = Vec::<String>::new();
+    let mut dep_modules = Vec::<String>::new();
 
     // ------------------------------------------------------------------
     // Parse the .pri file.
     // ------------------------------------------------------------------
     for raw_line in content.lines() {
         // Strip inline # comments.
-        let line = if let Some(idx) = raw_line.find('#') { &raw_line[..idx] } else { raw_line };
+        let line = if let Some(idx) = raw_line.find('#') {
+            &raw_line[..idx]
+        } else {
+            raw_line
+        };
         let line = line.trim();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
 
         // Split `KEY = VALUE` or `KEY += VALUE` on the first `=`.
-        let Some(eq_pos) = line.find('=') else { continue };
-        let key   = line[..eq_pos].trim().trim_end_matches('+').trim();
+        let Some(eq_pos) = line.find('=') else {
+            continue;
+        };
+        let key = line[..eq_pos].trim().trim_end_matches('+').trim();
         let value = line[eq_pos + 1..].trim();
 
         if key == key_module {
@@ -878,7 +885,7 @@ fn collect_module_includes(
                 let dep_name = {
                     let mut c = dep.chars();
                     match c.next() {
-                        None    => String::new(),
+                        None => String::new(),
                         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
                     }
                 };
@@ -932,7 +939,9 @@ fn collect_module_includes(
             if let Ok(entries) = base_path.read_dir() {
                 for entry in entries.flatten() {
                     let sub = entry.path();
-                    if !sub.is_dir() { continue; }
+                    if !sub.is_dir() {
+                        continue;
+                    }
                     let sub_name = sub.file_name().unwrap_or_default().to_string_lossy();
                     // e.g. library "KPim5AkonadiCore" contains prefix "KPim5"
                     if library_name.starts_with(sub_name.as_ref()) {
@@ -1023,7 +1032,7 @@ fn find_qmake() -> String {
     {
         "5" => &["qmake5", "qmake-qt5", "qmake"],
         "6" => &["qmake6", "qmake-qt6", "qmake"],
-        _   => &["qmake6", "qmake-qt6", "qmake5", "qmake-qt5", "qmake"],
+        _ => &["qmake6", "qmake-qt6", "qmake5", "qmake-qt5", "qmake"],
     };
 
     for &candidate in candidates {
@@ -1068,9 +1077,7 @@ fn qmake_query(qmake: &str) -> std::collections::HashMap<String, String> {
     let output = std::process::Command::new(qmake)
         .arg("-query")
         .output()
-        .unwrap_or_else(|e| {
-            panic!("Failed to run '{}': {}", qmake, e)
-        });
+        .unwrap_or_else(|e| panic!("Failed to run '{}': {}", qmake, e));
 
     if !output.status.success() {
         panic!(

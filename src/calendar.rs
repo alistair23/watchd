@@ -220,10 +220,7 @@ impl UrlCalendarProvider {
                     // e.g. "DTSTART;TZID=America/New_York" → inserts "DTSTART_TZID" = "America/New_York"
                     for param in &key_parts[1..] {
                         if let Some(tz) = param.strip_prefix("TZID=") {
-                            current_event.insert(
-                                format!("{}_TZID", prop_name),
-                                tz.to_string(),
-                            );
+                            current_event.insert(format!("{}_TZID", prop_name), tz.to_string());
                         }
                     }
 
@@ -914,9 +911,7 @@ impl CalendarManager {
         {
             use crate::akonadi_calendar_provider::AkonadiCalendarProvider;
             let akonadi = AkonadiCalendarProvider::new();
-            info!(
-                "Akonadi calendar provider registered — will wait for server on first use."
-            );
+            info!("Akonadi calendar provider registered — will wait for server on first use.");
             providers.push(Box::new(akonadi));
         }
 
@@ -1023,10 +1018,8 @@ mod tests {
     #[test]
     fn test_parse_ical_datetime_with_tzid() {
         // 2024-03-15 14:30:00 America/New_York = 2024-03-15 18:30:00 UTC (EDT = UTC-4)
-        let result = UrlCalendarProvider::parse_ical_datetime(
-            "20240315T143000",
-            Some("America/New_York"),
-        );
+        let result =
+            UrlCalendarProvider::parse_ical_datetime("20240315T143000", Some("America/New_York"));
         assert!(result.is_some());
         let timestamp = result.unwrap();
         let dt = Utc.timestamp_opt(timestamp, 0).unwrap();

@@ -12,11 +12,11 @@
 //! - `types`: Common types and enums used throughout the library
 
 pub mod air_quality_openaq;
-pub mod calendar;
 #[cfg(feature = "akonadi")]
 pub mod akonadi;
 #[cfg(feature = "akonadi")]
 pub mod akonadi_calendar_provider;
+pub mod calendar;
 pub mod cobs;
 pub mod communicator;
 pub mod data_transfer;
