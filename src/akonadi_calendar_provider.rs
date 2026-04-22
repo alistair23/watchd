@@ -324,7 +324,10 @@ impl AkonadiCalendarProvider {
         all_events.retain(|event| {
             let in_range = event.end_timestamp >= start && event.start_timestamp <= end;
             let day_ok = include_all_day || !event.all_day;
-            in_range && day_ok
+            // Don't send multiday events to the watch if we're currently in the middle
+            // of them — they clutter the upcoming list without being actionable.
+            let not_in_progress_multiday = !(event.is_multiday() && event.is_active());
+            in_range && day_ok && not_in_progress_multiday
         });
 
         // Sort chronologically.
@@ -542,6 +545,92 @@ END:VCALENDAR\r\n"
             1,
             "Expected 1 all-day event when include_all_day=true, got {}",
             events_inclusive.len()
+        );
+    }
+
+    /// Verify that a multiday event currently in progress is excluded.
+    #[test]
+    fn test_parse_and_filter_excludes_in_progress_multiday() {
+        let now = chrono::Utc::now();
+
+        // An event that started 2 days ago and ends 2 days from now (clearly multiday
+        // and currently active).
+        let start_dt = (now - chrono::Duration::days(2))
+            .format("%Y%m%dT%H%M%SZ")
+            .to_string();
+        let end_dt = (now + chrono::Duration::days(2))
+            .format("%Y%m%dT%H%M%SZ")
+            .to_string();
+
+        let in_progress_ics = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n\
+             BEGIN:VEVENT\r\n\
+             UID:in-progress-multiday@test\r\n\
+             SUMMARY:In-Progress Multiday Event\r\n\
+             DTSTART:{start_dt}\r\n\
+             DTEND:{end_dt}\r\n\
+             END:VEVENT\r\n\
+             END:VCALENDAR\r\n"
+        );
+
+        let window_start = now.timestamp() - 86400 * 7;
+        let window_end = now.timestamp() + 86400 * 7;
+
+        let events = AkonadiCalendarProvider::parse_and_filter(
+            vec![in_progress_ics],
+            window_start,
+            window_end,
+            0,
+            true,
+        );
+
+        assert!(
+            events.is_empty(),
+            "Expected in-progress multiday event to be excluded, got: {:?}",
+            events
+        );
+    }
+
+    /// Verify that a multiday event entirely in the future is NOT excluded.
+    #[test]
+    fn test_parse_and_filter_keeps_future_multiday() {
+        let now = chrono::Utc::now();
+
+        // An event that starts tomorrow and runs for 3 days.
+        let start_dt = (now + chrono::Duration::days(1))
+            .format("%Y%m%dT%H%M%SZ")
+            .to_string();
+        let end_dt = (now + chrono::Duration::days(4))
+            .format("%Y%m%dT%H%M%SZ")
+            .to_string();
+
+        let future_ics = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n\
+             BEGIN:VEVENT\r\n\
+             UID:future-multiday@test\r\n\
+             SUMMARY:Future Multiday Event\r\n\
+             DTSTART:{start_dt}\r\n\
+             DTEND:{end_dt}\r\n\
+             END:VEVENT\r\n\
+             END:VCALENDAR\r\n"
+        );
+
+        let window_start = now.timestamp();
+        let window_end = now.timestamp() + 86400 * 7;
+
+        let events = AkonadiCalendarProvider::parse_and_filter(
+            vec![future_ics],
+            window_start,
+            window_end,
+            0,
+            true,
+        );
+
+        assert_eq!(
+            events.len(),
+            1,
+            "Expected future multiday event to be included, got: {:?}",
+            events
         );
     }
 }

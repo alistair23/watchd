@@ -66,6 +66,11 @@ impl CalendarEvent {
         let now = Utc::now().timestamp();
         self.start_timestamp > now
     }
+
+    /// Check if the event spans more than 24 hours (a multiday event)
+    pub fn is_multiday(&self) -> bool {
+        self.duration_seconds() > 24 * 3600
+    }
 }
 
 /// Calendar provider trait for different calendar backends
@@ -847,7 +852,12 @@ impl CalendarProvider for UrlCalendarProvider {
                                 } else {
                                     !event.all_day
                                 };
-                                in_range && day_filter
+                                // Don't send multiday events the watch if we're currently
+                                // in the middle of them — they clutter the upcoming list
+                                // without being actionable.
+                                let not_in_progress_multiday =
+                                    !(event.is_multiday() && event.is_active());
+                                in_range && day_filter && not_in_progress_multiday
                             });
 
                             info!("Fetched {} events from {}", expanded_events.len(), url);
@@ -1066,5 +1076,50 @@ mod tests {
         };
 
         assert_eq!(event.duration_seconds(), 1000);
+    }
+
+    #[test]
+    fn test_is_multiday() {
+        let now = Utc::now().timestamp();
+
+        let make_event = |start: i64, end: i64| CalendarEvent {
+            id: "test".to_string(),
+            title: "Test".to_string(),
+            description: None,
+            location: None,
+            start_timestamp: start,
+            end_timestamp: end,
+            all_day: false,
+            calendar_name: "Test".to_string(),
+            organizer: None,
+            reminders: vec![],
+            color: 0,
+            rrule: None,
+        };
+
+        // Exactly 24 h — not multiday
+        let single = make_event(now, now + 86400);
+        assert!(!single.is_multiday(), "24 h event should not be multiday");
+
+        // More than 24 h — multiday
+        let multi = make_event(now - 86400, now + 86400);
+        assert!(multi.is_multiday(), "48 h event should be multiday");
+        assert!(multi.is_active(), "Event spanning now should be active");
+
+        // Multiday but entirely in the future — not active
+        let future_multi = make_event(now + 3600, now + 3600 + 2 * 86400);
+        assert!(future_multi.is_multiday());
+        assert!(
+            !future_multi.is_active(),
+            "Future multiday event should not be active"
+        );
+
+        // Multiday but already finished — not active
+        let past_multi = make_event(now - 3 * 86400, now - 86400);
+        assert!(past_multi.is_multiday());
+        assert!(
+            !past_multi.is_active(),
+            "Past multiday event should not be active"
+        );
     }
 }
