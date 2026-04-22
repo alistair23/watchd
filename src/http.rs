@@ -1735,6 +1735,18 @@ fn convert_oauth_to_form_encoded(
 ) -> Result<Vec<u8>> {
     use std::str;
 
+    // If the body is already form-encoded, pass it through unchanged
+    let content_type = headers
+        .iter()
+        .find(|(k, _)| k.to_lowercase() == "content-type")
+        .map(|(_, v)| v.to_lowercase())
+        .unwrap_or_default();
+
+    if content_type.contains("application/x-www-form-urlencoded") {
+        debug!("Body is already form-encoded, passing through unchanged");
+        return Ok(json_data.to_vec());
+    }
+
     // Trim any null terminators from the data (common with C/protobuf strings)
     let json_data_trimmed = if json_data.last() == Some(&0) {
         &json_data[..json_data.len() - 1]
