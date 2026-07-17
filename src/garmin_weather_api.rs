@@ -14,6 +14,27 @@ use crate::weather_provider::{UnifiedWeatherData, UnifiedWeatherProvider};
 use log::{debug, error, info};
 use serde::Serialize;
 
+/// Error handling an intercepted Garmin weather API request
+#[derive(Debug)]
+pub enum WeatherApiError {
+    /// The location is outside the region the local weather provider supports.
+    /// The caller should proxy the request through to Garmin's real weather API.
+    LocationNotSupported,
+    /// Any other failure while handling the request locally
+    Other(String),
+}
+
+impl std::fmt::Display for WeatherApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WeatherApiError::LocationNotSupported => {
+                write!(f, "location not supported by local weather provider")
+            }
+            WeatherApiError::Other(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
 /// Check if a URL is a Garmin weather API request that should be intercepted
 pub fn is_garmin_weather_api(url: &str) -> bool {
     url.contains("api.gcs.garmin.com/weather") || url.contains("/weather/v2/forecast")
@@ -67,7 +88,7 @@ fn extract_path(url: &str) -> String {
 pub async fn handle_garmin_weather_request(
     request: &HttpRequest,
     weather_provider: &UnifiedWeatherProvider,
-) -> Result<HttpResponse, String> {
+) -> Result<HttpResponse, WeatherApiError> {
     info!("☀️  Intercepting Garmin weather API request");
     info!("   URL: {}", request.url);
     info!("   Path: {}", request.path);
@@ -80,13 +101,13 @@ pub async fn handle_garmin_weather_request(
         .query
         .get("lat")
         .and_then(|s| s.parse::<i32>().ok())
-        .ok_or_else(|| "Missing or invalid 'lat' parameter".to_string())?;
+        .ok_or_else(|| WeatherApiError::Other("Missing or invalid 'lat' parameter".to_string()))?;
 
     let lon = request
         .query
         .get("lon")
         .and_then(|s| s.parse::<i32>().ok())
-        .ok_or_else(|| "Missing or invalid 'lon' parameter".to_string())?;
+        .ok_or_else(|| WeatherApiError::Other("Missing or invalid 'lon' parameter".to_string()))?;
 
     debug!("   Coordinates: lat={}, lon={}", lat, lon);
 
@@ -94,7 +115,13 @@ pub async fn handle_garmin_weather_request(
     let weather_data = weather_provider
         .fetch_weather_with_air_quality(lat, lon)
         .await
-        .map_err(|e| format!("Failed to fetch weather: {}", e))?;
+        .map_err(|e| {
+            if e.is_location_not_supported() {
+                WeatherApiError::LocationNotSupported
+            } else {
+                WeatherApiError::Other(format!("Failed to fetch weather: {}", e))
+            }
+        })?;
 
     debug!("   ✅ Weather data fetched successfully");
     debug!("   Location: {}", weather_data.location_name);
@@ -109,19 +136,19 @@ pub async fn handle_garmin_weather_request(
     let response_json = if path.contains("/weather/v1/current")
         || path.contains("/weather/v2/current")
     {
-        handle_current_weather(&request, &weather_data)?
+        handle_current_weather(&request, &weather_data).map_err(WeatherApiError::Other)?
     } else if path.contains("/weather/v1/forecast/hour")
         || path.contains("/weather/v2/forecast/hour")
     {
-        handle_hourly_forecast(&request, &weather_data)?
+        handle_hourly_forecast(&request, &weather_data).map_err(WeatherApiError::Other)?
     } else if path.contains("/weather/v1/forecast/day") || path.contains("/weather/v2/forecast/day")
     {
-        handle_daily_forecast(&request, &weather_data)?
+        handle_daily_forecast(&request, &weather_data).map_err(WeatherApiError::Other)?
     } else {
         // Default to handling it as a general forecast request
         // The watch might request /weather/v2/forecast without a specific endpoint
         error!("   ℹ️  Unknown weather path, defaulting to daily forecast");
-        handle_daily_forecast(&request, &weather_data)?
+        handle_daily_forecast(&request, &weather_data).map_err(WeatherApiError::Other)?
     };
 
     debug!(

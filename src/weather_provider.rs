@@ -22,11 +22,20 @@ pub enum WeatherProviderError {
     #[error("OpenAQ error: {0}")]
     OpenAq(#[from] OpenAqError),
 
-    #[error("No suitable weather provider available")]
-    NoProvider,
+    #[error("Location (lat={0:.2}, lon={1:.2}) not supported by local weather provider")]
+    LocationNotSupported(f64, f64),
 
     #[error("Provider not configured: {0}")]
     NotConfigured(String),
+}
+
+impl WeatherProviderError {
+    /// Whether this error indicates the location is outside the region the
+    /// local provider supports (so callers may fall back to another source,
+    /// e.g. proxying to Garmin's real weather API).
+    pub fn is_location_not_supported(&self) -> bool {
+        matches!(self, WeatherProviderError::LocationNotSupported(_, _))
+    }
 }
 
 /// Weather provider type
@@ -227,21 +236,25 @@ impl UnifiedWeatherProvider {
         let lon = semicircles_to_degrees(lon_semicircles);
 
         match self.provider_type {
-            WeatherProviderType::Bom => self.fetch_from_bom(lat_semicircles, lon_semicircles).await,
-            WeatherProviderType::Auto => {
-                // Auto-select based on location
-                if self.is_in_australia(lat, lon) {
-                    log::info!("Auto-selected BOM for Australian location");
-                    match self.fetch_from_bom(lat_semicircles, lon_semicircles).await {
-                        Ok(data) => Ok(data),
-                        Err(e) => {
-                            log::error!("BOM failed: {}", e);
-                            return Err(e);
-                        }
+            WeatherProviderType::Bom | WeatherProviderType::Auto => {
+                // BOM only covers Australia; report unsupported locations so
+                // the caller can fall back to Garmin's weather API
+                if !self.is_in_australia(lat, lon) {
+                    log::info!(
+                        "Location (lat={:.2}, lon={:.2}) is outside BOM coverage",
+                        lat,
+                        lon
+                    );
+                    return Err(WeatherProviderError::LocationNotSupported(lat, lon));
+                }
+
+                log::info!("Using BOM for Australian location");
+                match self.fetch_from_bom(lat_semicircles, lon_semicircles).await {
+                    Ok(data) => Ok(data),
+                    Err(e) => {
+                        log::error!("BOM failed: {}", e);
+                        Err(e)
                     }
-                } else {
-                    log::error!("No provider for non-Australian location");
-                    return Err(WeatherProviderError::NoProvider);
                 }
             }
         }
@@ -268,7 +281,15 @@ impl UnifiedWeatherProvider {
 
         let data = service
             .fetch_weather(lat_semicircles, lon_semicircles)
-            .await?;
+            .await
+            .map_err(|e| match e {
+                // BOM has no location near these coordinates (e.g. offshore or
+                // just inside the bounding box): treat as unsupported region
+                BomWeatherError::LocationNotFound(lat, lon) => {
+                    WeatherProviderError::LocationNotSupported(lat, lon)
+                }
+                other => WeatherProviderError::Bom(other),
+            })?;
         Ok(Self::convert_bom_to_unified(data))
     }
 
@@ -417,6 +438,22 @@ mod tests {
 
         // Tokyo (not Australia)
         assert!(!provider.is_in_australia(35.68, 139.65));
+    }
+
+    #[tokio::test]
+    async fn test_location_outside_bom_coverage_is_not_supported() {
+        let provider = UnifiedWeatherProvider::new(WeatherProviderType::Bom, Some(600));
+
+        // London in semicircles: (degrees / 180) * 2^31
+        let lat = (51.51_f64 / 180.0 * 2_147_483_648.0) as i32;
+        let lon = (-0.13_f64 / 180.0 * 2_147_483_648.0) as i32;
+
+        // The coverage check happens before any network request
+        let result = provider.fetch_weather(lat, lon).await;
+        match result {
+            Err(ref e) if e.is_location_not_supported() => {}
+            other => panic!("expected LocationNotSupported, got {:?}", other.map(|_| ())),
+        }
     }
 
     #[tokio::test]

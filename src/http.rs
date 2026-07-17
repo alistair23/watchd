@@ -1153,6 +1153,11 @@ pub async fn handle_http_request_with_weather(
                     );
                     return response;
                 }
+                Err(garmin_weather_api::WeatherApiError::LocationNotSupported) => {
+                    // Outside the region the local provider (BOM) supports:
+                    // fall through and proxy to Garmin's real weather API
+                    info!("   🌐 Location outside BOM coverage, falling back to Garmin weather");
+                }
                 Err(e) => {
                     error!("   ❌ Weather API handler error: {}", e);
                     return garmin_weather_api::handle_garmin_blocked_request(request);

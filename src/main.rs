@@ -408,6 +408,7 @@ pub struct GarminNotificationHandler {
     next_notification_id: Arc<Mutex<i32>>,
     last_cleanup_time: Arc<Mutex<std::time::Instant>>,
     seen_dbus_messages: Arc<Mutex<std::collections::HashSet<(String, u64)>>>, // (summary, body_hash) - app_name excluded to handle same notification from different interfaces
+    seen_calendar_reminders: Arc<Mutex<HashMap<String, std::time::Instant>>>, // summary -> time first forwarded
     watchdog: Arc<WatchdogManager>,
     missed_notifications: Arc<Mutex<VecDeque<NotificationSpec>>>,
     is_connected: Arc<Mutex<bool>>,
@@ -425,6 +426,7 @@ impl GarminNotificationHandler {
             next_notification_id: Arc::new(Mutex::new(100)),
             last_cleanup_time: Arc::new(Mutex::new(std::time::Instant::now())),
             seen_dbus_messages: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            seen_calendar_reminders: Arc::new(Mutex::new(HashMap::new())),
             watchdog,
             missed_notifications: Arc::new(Mutex::new(VecDeque::new())),
             is_connected: Arc::new(Mutex::new(true)),
@@ -3636,6 +3638,26 @@ async fn handle_dbus_notification(
             .get("desktop-entry")
             .and_then(|v| <&str>::try_from(v).ok())
     );
+
+    // Suppress duplicate calendar reminders. The phone generates a new notification
+    // each minute as the event approaches (15 min before, 14 min before, …). We only
+    // want to forward the first one per event title within a 20-minute window.
+    if matches!(notification_type, NotificationType::GenericCalendar) {
+        let mut seen = handler.seen_calendar_reminders.lock().unwrap();
+        let now = std::time::Instant::now();
+        const CALENDAR_REMINDER_WINDOW: std::time::Duration =
+            std::time::Duration::from_secs(20 * 60);
+        seen.retain(|_, t| now.duration_since(*t) < CALENDAR_REMINDER_WINDOW);
+        if let Some(first_seen) = seen.get(&notification_summary) {
+            println!(
+                "   ⏭️  Skipping duplicate calendar reminder for '{}' (first forwarded {:.0}s ago)",
+                notification_summary,
+                now.duration_since(*first_seen).as_secs_f64()
+            );
+            return Ok(());
+        }
+        seen.insert(notification_summary.clone(), now);
+    }
 
     // Generate notification ID
     let notification_id = handler.get_next_notification_id();
