@@ -18,6 +18,27 @@ use log::{debug, error, info};
 use reqwest;
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::OnceLock;
+
+/// Shared HTTP client with connection pooling.
+///
+/// Reusing a single client keeps TCP/TLS connections alive between requests,
+/// which significantly speeds up bursts of requests to the same host (e.g.
+/// the watch fetching a sequence of radar images).
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn shared_http_client() -> Result<reqwest::Client> {
+    if let Some(client) = HTTP_CLIENT.get() {
+        return Ok(client.clone());
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| GarminError::InvalidMessage(format!("Failed to create HTTP client: {}", e)))?;
+
+    Ok(HTTP_CLIENT.get_or_init(|| client).clone())
+}
 
 /// HTTP methods supported by the watch
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1220,11 +1241,8 @@ async fn proxy_http_request(request: &HttpRequest) -> Result<HttpResponse> {
         request.body.clone()
     };
 
-    // Create a blocking reqwest client
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| GarminError::InvalidMessage(format!("Failed to create HTTP client: {}", e)))?;
+    // Use the shared client so pooled connections are reused across requests
+    let client = shared_http_client()?;
 
     // Build the request
     let mut req_builder = match request.method {

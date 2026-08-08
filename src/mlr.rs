@@ -191,7 +191,7 @@ impl MlrCommunicator {
         }
 
         drop(state);
-        self.run_protocol().await?;
+        self.drain_send_queue().await?;
 
         Ok(())
     }
@@ -262,26 +262,33 @@ impl MlrCommunicator {
             drop(state);
         }
 
-        // Run protocol multiple times to drain queue if window opened up
-        for _ in 0..10 {
-            match self.run_protocol().await {
-                Ok(_) => {
-                    // Check if there are more fragments to send
-                    let state = self.state.lock().await;
-                    if state.fragment_queue.is_empty() {
-                        break;
-                    }
-                    let num_sent_unacked = Self::seq_diff(state.next_send_seq, state.last_rcv_ack);
-                    if num_sent_unacked >= state.max_num_unacked_send {
-                        debug!("Send window full, will resume after next ACK");
-                        break;
-                    }
-                    drop(state);
-                }
-                Err(e) => {
-                    error!("Protocol run failed: {}", e);
-                    break;
-                }
+        // Drain the queue in case the window opened up
+        if let Err(e) = self.drain_send_queue().await {
+            error!("Protocol run failed: {}", e);
+        }
+
+        Ok(())
+    }
+
+    /// Run the protocol repeatedly, sending pending fragments until the queue
+    /// is empty or the send window is full.
+    ///
+    /// Each `run_protocol` call sends at most one fragment, so large messages
+    /// (e.g. HTTP responses carrying radar images) must be pumped in a loop to
+    /// keep the send window filled rather than waiting for the watch to ACK
+    /// each fragment.
+    async fn drain_send_queue(&self) -> Result<()> {
+        loop {
+            self.run_protocol().await?;
+
+            let state = self.state.lock().await;
+            if state.paused || state.fragment_queue.is_empty() {
+                break;
+            }
+            let num_sent_unacked = Self::seq_diff(state.next_send_seq, state.last_rcv_ack);
+            if num_sent_unacked >= state.max_num_unacked_send {
+                debug!("Send window full, will resume after next ACK");
+                break;
             }
         }
 

@@ -1078,10 +1078,10 @@ impl CommunicatorV2 {
                 service, mlr_handle
             );
 
-            // Get the send characteristic
-            let send_char = {
+            // Get the send characteristic and current max write size
+            let (send_char, max_write_size) = {
                 let state = self.state.lock().await;
-                state.characteristic_send.clone()
+                (state.characteristic_send.clone(), state.max_write_size)
             };
 
             if send_char.is_none() {
@@ -1103,8 +1103,8 @@ impl CommunicatorV2 {
                 cobs_codec: Mutex::new(CobsCoDec::new()),
             });
 
-            // Create and start MLR communicator
-            let mut mlr = MlrCommunicator::new(mlr_handle, 20, sender, receiver);
+            // Create and start MLR communicator using the negotiated packet size
+            let mut mlr = MlrCommunicator::new(mlr_handle, max_write_size, sender, receiver);
 
             if let Err(e) = mlr.start() {
                 warn!("Failed to start MLR communicator: {}", e);

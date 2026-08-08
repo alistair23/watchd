@@ -1425,6 +1425,24 @@ impl BlueRSupport {
         Ok(())
     }
 
+    /// Query the negotiated ATT MTU from BlueZ (requires BlueZ >= 5.62)
+    ///
+    /// Returns the MTU reported for any discovered characteristic; the ATT MTU
+    /// is shared across the connection so any characteristic will do.
+    async fn gatt_mtu(&self) -> Option<usize> {
+        let characteristics: Vec<Characteristic> = {
+            let chars = self.characteristics.lock().unwrap();
+            chars.values().cloned().collect()
+        };
+
+        for characteristic in characteristics {
+            if let Ok(mtu) = characteristic.mtu().await {
+                return Some(mtu);
+            }
+        }
+        None
+    }
+
     /// Start notification listener with real-time bidirectional communication
     async fn start_notification_listener(
         &self,
@@ -2928,7 +2946,13 @@ impl AsyncGfdiMessageCallback for AsyncMessageHandler {
 
                                                         // Field 2: id (varint)
                                                         download_response.push((2 << 3) | 0);
-                                                        download_response.push(id as u8);
+                                                        let mut id_val = id;
+                                                        while id_val >= 0x80 {
+                                                            download_response
+                                                                .push((id_val as u8) | 0x80);
+                                                            id_val >>= 7;
+                                                        }
+                                                        download_response.push(id_val as u8);
 
                                                         // Field 3: offset (varint)
                                                         download_response.push((3 << 3) | 0);
@@ -4113,6 +4137,18 @@ async fn connect_to_watch(
 
     if !init_result {
         return Err(Box::new(std::io::Error::other("Initialization failed")));
+    }
+
+    // Query the negotiated ATT MTU so large transfers (e.g. radar images) are
+    // not sent in tiny 20-byte default packets
+    match ble_arc.gatt_mtu().await {
+        Some(mtu) => {
+            println!("   ✅ Negotiated ATT MTU: {} bytes", mtu);
+            communicator.on_mtu_changed(mtu).await;
+        }
+        None => {
+            println!("   ⚠️  Could not read ATT MTU (BlueZ < 5.62?), using default packet size");
+        }
     }
 
     // Create Arc for communicator
